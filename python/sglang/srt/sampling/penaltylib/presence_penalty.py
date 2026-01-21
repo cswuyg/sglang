@@ -48,6 +48,12 @@ class BatchedPresencePenalizer(_BatchedPenalizer):
             keep_indices
         ]
 
+    def _reorder(self, reorder_indices: torch.Tensor):
+        self.presence_penalties = self.presence_penalties[reorder_indices]
+        self.cumulated_presence_penalties = self.cumulated_presence_penalties[
+            reorder_indices
+        ]
+
     def _merge(self, their: "BatchedPresencePenalizer"):
         self.presence_penalties = torch.cat(
             [self.presence_penalties, their.presence_penalties], dim=0

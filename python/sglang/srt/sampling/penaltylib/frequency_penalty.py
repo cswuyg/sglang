@@ -48,6 +48,12 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             keep_indices
         ]
 
+    def _reorder(self, reorder_indices: torch.Tensor):
+        self.frequency_penalties = self.frequency_penalties[reorder_indices]
+        self.cumulated_frequency_penalties = self.cumulated_frequency_penalties[
+            reorder_indices
+        ]
+
     def _merge(self, their: "BatchedFrequencyPenalizer"):
         self.frequency_penalties = torch.cat(
             [self.frequency_penalties, their.frequency_penalties], dim=0

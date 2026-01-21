@@ -75,6 +75,11 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
         self.stop_token_penalties = self.stop_token_penalties[keep_indices]
         self.len_output_tokens = self.len_output_tokens[keep_indices]
 
+    def _reorder(self, reorder_indices: torch.Tensor):
+        self.min_new_tokens = self.min_new_tokens[reorder_indices]
+        self.stop_token_penalties = self.stop_token_penalties[reorder_indices]
+        self.len_output_tokens = self.len_output_tokens[reorder_indices]
+
     def _merge(self, their: "BatchedMinNewTokensPenalizer"):
         self.min_new_tokens = torch.cat(
             [self.min_new_tokens, their.min_new_tokens], dim=0

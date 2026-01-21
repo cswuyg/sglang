@@ -72,9 +72,6 @@ class SchedulerBeamSearchProcessorMixin:
         logger.debug(f"[prefill process]beam_width_list: {beam_width_list}")
 
         for i, req in enumerate(batch.reqs):
-            if req.is_retracted:
-                continue
-
             self._process_beam_search_prefill_result_single_req(
                 req=req,
                 batch=batch,
@@ -87,6 +84,8 @@ class SchedulerBeamSearchProcessorMixin:
                 req.time_stats.completion_time = time.perf_counter()
             elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                 self.tree_cache.cache_unfinished_req(req)
+
+        self._handle_prefill_penalty_expansion(batch, logits_output.logprobs.device)
 
         self.stream_output(batch.reqs, batch.return_logprob, None)
 
@@ -117,14 +116,11 @@ class SchedulerBeamSearchProcessorMixin:
             batch, result
         )
 
-        reqs_for_kv_copy = []
+        reqs_for_beam_reorder = []
         last_batch_slot_indices_list = []
 
         offset = 0
         for req in batch.reqs:
-            if req.is_retracted:
-                continue
-
             start_idx = offset
             end_idx = offset + req.beam_width
             offset = end_idx
@@ -141,7 +137,7 @@ class SchedulerBeamSearchProcessorMixin:
             )
 
             if last_batch_slot_indices is not None:
-                reqs_for_kv_copy.append(req)
+                reqs_for_beam_reorder.append(req)
                 last_batch_slot_indices_list.append(last_batch_slot_indices)
 
             if req.finished():
@@ -155,14 +151,18 @@ class SchedulerBeamSearchProcessorMixin:
                 req.beam_list.completed = completed[: req.beam_width]
                 req.beam_list.incomplete = []
 
+        self._handle_decode_penalty_expansion(
+            batch, reqs_for_beam_reorder, last_batch_slot_indices_list
+        )
+
         self.stream_output(batch.reqs, batch.return_logprob)
 
         self.token_to_kv_pool_allocator.free_group_begin()
         if any([req.finished() for req in batch.reqs]):
             self._cache_finished_beam_search(batch)
-        if reqs_for_kv_copy:
+        if reqs_for_beam_reorder:
             self._handle_beam_kv_cache(
-                batch, reqs_for_kv_copy, last_batch_slot_indices_list
+                batch, reqs_for_beam_reorder, last_batch_slot_indices_list
             )
         self.token_to_kv_pool_allocator.free_group_end()
 
@@ -542,8 +542,11 @@ class SchedulerBeamSearchProcessorMixin:
             top_logprobs: Top-k logprobs for current beam branches, Shape: [beam_width, topk]
 
         Returns:
-            Optional[torch.Tensor]: If KV cache processing needed, returns last_batch_slot_indices
-                                   (positions of surviving beams in batch), otherwise None
+            Optional[torch.Tensor]: Parent beam batch slot indices for next round's beams.
+                                   Shape: [beam_width], each value indicates the batch slot index
+                                   of the parent beam that the new beam extends from.
+                                   Used for KV cache copying and penalty state expansion/pruning.
+                                   None if request is finished.
         """
         # [beam_width, 1] + [beam_width, topK] -> [beam_width, topK]
         all_cum_logprobs = req.beam_list.cum_logprobs.unsqueeze(1) + top_logprobs
@@ -622,8 +625,10 @@ class SchedulerBeamSearchProcessorMixin:
             all_tokens_flat: Flattened array of all candidate tokens
 
         Returns:
-            Optional[List[int]]: List of surviving beam indices from previous round,
-                                None if request is finished
+            Optional[List[int]]: Parent beam indices for next round's beams.
+                                Length equals beam_width, each value in [0, beam_width-1]
+                                indicates which previous beam the new beam extends from.
+                                None if request is finished.
         """
 
         last_beam_indices = topk_indices // topk
@@ -1124,3 +1129,114 @@ class SchedulerBeamSearchProcessorMixin:
             float: Normalized score (cum_logprob / seq_len^length_penalty)
         """
         return cum_logprob / (seq_len**length_penalty)
+
+    def _handle_prefill_penalty_expansion(
+        self, batch: ScheduleBatch, device: torch.device
+    ) -> None:
+        """Handle penalty state expansion after prefill for beam search requests.
+
+        After processing all prefill results, this method:
+        1. Expands penalty states from request level [num_requests, vocab] to beam level [total_beams, vocab]
+        2. Cumulates the initial beam tokens into penalty states
+
+        Args:
+            batch: Schedule batch containing beam search requests
+            device: Device where tensors are located
+        """
+        if (
+            not batch.sampling_info
+            or not batch.sampling_info.penalizer_orchestrator.is_required
+        ):
+            return
+
+        all_beam_tokens = []
+        reorder_indices = []
+
+        for req_idx, req in enumerate(batch.reqs):
+            if req.beam_list.last_tokens is None:
+                # Maintain complete shape; filter_batch handles finished requests
+                all_beam_tokens.append(
+                    torch.zeros(req.beam_width, dtype=torch.int64, device=device)
+                )
+            else:
+                all_beam_tokens.append(req.beam_list.last_tokens)
+            reorder_indices.extend([req_idx] * req.beam_width)
+
+        reorder_indices_tensor = torch.tensor(
+            reorder_indices, dtype=torch.int64, device=device
+        )
+        batch.sampling_info.penalizer_orchestrator.reorder(reorder_indices_tensor)
+        all_beam_tokens_tensor = torch.cat(all_beam_tokens, dim=0).to(torch.int64)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            all_beam_tokens_tensor
+        )
+
+    def _handle_decode_penalty_expansion(
+        self,
+        batch: ScheduleBatch,
+        reqs_for_beam_reorder: List[Req],
+        last_batch_slot_indices_list: List[torch.Tensor],
+    ) -> None:
+        """Handle penalty state reordering and cumulation after decode for beam search requests.
+
+        After processing all decode results and beam expansions/prunings, this method:
+        1. Handles finished requests by maintaining their penalty state structure
+        2. Reorders penalty states to match the new beam structure (after expansion/pruning)
+        3. Cumulates the newly generated tokens into penalty states
+
+        Args:
+            batch: Schedule batch containing beam search requests
+            reqs_for_beam_reorder: List of requests that have beam reordering
+            last_batch_slot_indices_list: List of surviving beam positions for each request
+        """
+        if (
+            not batch.sampling_info
+            or not batch.sampling_info.penalizer_orchestrator.is_required
+        ):
+            return
+
+        req_to_reorder_idx = {req: idx for idx, req in enumerate(reqs_for_beam_reorder)}
+
+        global_reorder_indices = []
+        all_new_tokens = []
+        current_beam_offset = 0
+
+        for req in batch.reqs:
+            if req.finished():
+                global_reorder_indices.extend(
+                    range(current_beam_offset, current_beam_offset + req.beam_width)
+                )
+                all_new_tokens.append(
+                    torch.zeros(req.beam_width, dtype=torch.int64, device=batch.device)
+                )
+
+            else:
+                req_idx_in_list = req_to_reorder_idx.get(req)
+
+                if req_idx_in_list is not None:
+                    last_batch_slot_indices = last_batch_slot_indices_list[
+                        req_idx_in_list
+                    ]
+                    base_idx = req.beam_list.batch_slot_start_idx
+                    relative_indices = (
+                        last_batch_slot_indices - base_idx + current_beam_offset
+                    ).tolist()
+                    global_reorder_indices.extend(relative_indices)
+                else:
+                    global_reorder_indices.extend(
+                        range(current_beam_offset, current_beam_offset + req.beam_width)
+                    )
+
+                all_new_tokens.append(req.beam_list.last_tokens)
+
+            current_beam_offset += req.beam_width
+
+        reorder_indices_tensor = torch.tensor(
+            global_reorder_indices, dtype=torch.int64, device=batch.device
+        )
+        batch.sampling_info.penalizer_orchestrator.reorder(reorder_indices_tensor)
+
+        all_new_tokens_tensor = torch.cat(all_new_tokens, dim=0).to(torch.int64)
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+            all_new_tokens_tensor
+        )

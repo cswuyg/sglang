@@ -92,6 +92,7 @@ class Sampler(nn.Module):
 
         if is_beam_search:
             # For beam search, only compute logprobs here. Sampling is handled externally.
+            logits = self._preprocess_logits(logits, sampling_info)
             logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
             logits_output.logprobs = logprobs
             return None

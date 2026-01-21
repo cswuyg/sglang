@@ -91,6 +91,35 @@ class BatchedPenalizerOrchestrator:
                 penalizer.teardown()
         self.is_required = is_required
 
+    def reorder(self, reorder_indices: torch.Tensor):
+        """
+        Reshape penalty states based on beam search expansion, pruning, and reordering.
+
+        This method handles three types of transformations:
+        1. **Expansion**: Duplicate penalty states when beams are expanded
+           Example: [0, 0, 1, 1] expands 2 states to 4 (each duplicated)
+        2. **Pruning**: Remove penalty states for pruned beams
+           Example: [0, 2, 3] keeps only 3 out of 4 states (state 1 is pruned)
+        3. **Reordering**: Rearrange penalty states to match new beam order
+           Example: [1, 0, 2] reorders 3 states
+
+        Args:
+            reorder_indices (torch.Tensor): Indices mapping new positions to old positions.
+                Shape: [new_size], where new_size can be larger (expansion),
+                smaller (pruning), or equal (pure reordering) to the old size.
+
+                Example scenarios:
+                - Prefill expansion: [0, 0, 1, 1] (2 requests → 4 beams, beam_width=2)
+                - Decode expansion: [0, 0, 0, 1, 1, 1] (2 beams → 6 beams, expand each to 3)
+                - Decode pruning: [0, 2, 3] (4 beams → 3 beams, beam 1 pruned)
+        """
+        if not self.is_required:
+            return
+
+        for penalizer in self.penalizers.values():
+            if penalizer.is_required():
+                penalizer.reorder(reorder_indices)
+
     # Resource management helpers
     def release(self) -> None:
         """Release all penalizers and break references so GC can reclaim promptly."""
@@ -188,6 +217,12 @@ class _BatchedPenalizer(abc.ABC):
 
         self._filter(keep_indices=keep_indices)
 
+    def reorder(self, reorder_indices: torch.Tensor):
+        if not self._is_prepared:
+            return
+
+        self._reorder(reorder_indices=reorder_indices)
+
     def merge(self, their: "_BatchedPenalizer"):
         if not self._is_prepared and not their._is_prepared:
             return
@@ -231,6 +266,20 @@ class _BatchedPenalizer(abc.ABC):
     def _filter(self, keep_indices: torch.Tensor):
         """
         Filter the penalizer (tensors or underlying data) based on the indices to keep in the batch.
+        """
+        pass
+
+    @abc.abstractmethod
+    def _reorder(self, reorder_indices: torch.Tensor):
+        """
+        Reshape the penalizer states based on beam search expansion, pruning, and reordering.
+
+        This method should handle expansion (duplication), pruning (removal), and
+        reordering (rearrangement) of penalty states using advanced indexing.
+
+        Args:
+            reorder_indices (torch.Tensor): Indices mapping new positions to old positions.
+                The implementation typically uses: self.state = self.state[reorder_indices]
         """
         pass
 

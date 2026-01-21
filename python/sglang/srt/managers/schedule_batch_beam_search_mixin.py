@@ -95,6 +95,9 @@ class ScheduleBatchBeamSearchMixin:
         if len(keep_indices) == len(self.reqs):
             return
 
+        # Filter penalizer states before filtering self.reqs
+        self._filter_penalizer_states(keep_indices)
+
         old_pool_indices = []
         extend_idx = 0
         for req in self.reqs:
@@ -248,6 +251,39 @@ class ScheduleBatchBeamSearchMixin:
         for req in new_reqs:
             req.beam_list.batch_slot_start_idx = current_idx
             current_idx += req.beam_width
+
+    def _filter_penalizer_states(self, keep_indices: List[int]):
+        """
+        Filter penalizer states to match the filtered beam search requests.
+
+        This method calculates which beam indices to keep in the penalizer state
+        based on which requests are being kept. Penalizer states are organized by beam:
+        [req0_beam0, req0_beam1, ..., req1_beam0, req1_beam1, ...]
+
+        Args:
+            keep_indices: List of request indices to keep (before filtering self.reqs)
+        """
+        if not self.sampling_info or not self.sampling_info.penalizer_orchestrator:
+            return
+
+        # Calculate penalizer keep indices BEFORE filtering self.reqs
+        # Note: We cannot use keep_pool_indices directly because penalizer expand/prune happens
+        # after prefill/decode completion, while pool indices are generated before request execution.
+        penalizer_keep_indices_list = []
+        current_offset = 0
+
+        for original_idx, req in enumerate(self.reqs):
+            if original_idx in keep_indices:
+                penalizer_keep_indices_list.extend(
+                    range(current_offset, current_offset + req.beam_width)
+                )
+            current_offset += req.beam_width
+
+        penalizer_keep_indices = torch.tensor(
+            penalizer_keep_indices_list, dtype=torch.int64, device=self.device
+        )
+
+        self.sampling_info.penalizer_orchestrator.filter(penalizer_keep_indices)
 
 
 class ReqBeamSearchMixin:
