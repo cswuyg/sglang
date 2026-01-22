@@ -1143,10 +1143,7 @@ class SchedulerBeamSearchProcessorMixin:
             batch: Schedule batch containing beam search requests
             device: Device where tensors are located
         """
-        if (
-            not batch.sampling_info
-            or not batch.sampling_info.penalizer_orchestrator.is_required
-        ):
+        if not batch.sampling_info.penalizer_orchestrator.is_required:
             return
 
         all_beam_tokens = []
@@ -1189,10 +1186,7 @@ class SchedulerBeamSearchProcessorMixin:
             reqs_for_beam_reorder: List of requests that have beam reordering
             last_batch_slot_indices_list: List of surviving beam positions for each request
         """
-        if (
-            not batch.sampling_info
-            or not batch.sampling_info.penalizer_orchestrator.is_required
-        ):
+        if not batch.sampling_info.penalizer_orchestrator.is_required:
             return
 
         req_to_reorder_idx = {req: idx for idx, req in enumerate(reqs_for_beam_reorder)}

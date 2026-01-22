@@ -2021,5 +2021,298 @@ class TestCalculateBeamScore(unittest.TestCase):
         self.assertAlmostEqual(score, expected, places=5)
 
 
+class TestHandlePrefillPenaltyExpansion(unittest.TestCase):
+    """Test _handle_prefill_penalty_expansion method."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.scheduler = create_mock_scheduler()
+
+    def test_handle_prefill_penalty_expansion_no_sampling_info(self):
+        """Test penalty expansion when batch has no sampling_info (early return)."""
+        device = torch.device("cpu")
+
+        batch = Mock()
+        batch.sampling_info = None
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Should return early without any operations
+
+    def test_handle_prefill_penalty_expansion_not_required(self):
+        """Test penalty expansion when penalizer is not required (early return)."""
+        device = torch.device("cpu")
+
+        batch = Mock()
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = False
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Should return early without calling reorder or cumulate_output_tokens
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_not_called()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_not_called()
+
+    def test_handle_prefill_penalty_expansion_single_request(self):
+        """Test penalty expansion with a single beam search request."""
+        device = torch.device("cpu")
+
+        # Create request with beam_list.last_tokens
+        req = Mock()
+        req.beam_width = 3
+        req.beam_list = Mock()
+        req.beam_list.last_tokens = torch.tensor([100, 200, 300], device=device)
+
+        batch = Mock()
+        batch.reqs = [req]
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Verify reorder was called with correct indices
+        # For single request with beam_width=3: [0, 0, 0]
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_called_once()
+        reorder_indices = batch.sampling_info.penalizer_orchestrator.reorder.call_args[
+            0
+        ][0]
+        expected_reorder = torch.tensor([0, 0, 0], dtype=torch.int64, device=device)
+        self.assertTrue(torch.equal(reorder_indices, expected_reorder))
+
+        # Verify cumulate_output_tokens was called with correct tokens
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_called_once()
+        cumulated_tokens = (
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.call_args[
+                0
+            ][0]
+        )
+        expected_tokens = torch.tensor(
+            [100, 200, 300], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(cumulated_tokens, expected_tokens))
+
+    def test_handle_prefill_penalty_expansion_multiple_requests(self):
+        """Test penalty expansion with multiple beam search requests."""
+        device = torch.device("cpu")
+
+        # Create first request with beam_width=2
+        req1 = Mock()
+        req1.beam_width = 2
+        req1.beam_list = Mock()
+        req1.beam_list.last_tokens = torch.tensor([100, 200], device=device)
+
+        # Create second request with beam_width=3
+        req2 = Mock()
+        req2.beam_width = 3
+        req2.beam_list = Mock()
+        req2.beam_list.last_tokens = torch.tensor([300, 400, 500], device=device)
+
+        batch = Mock()
+        batch.reqs = [req1, req2]
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Verify reorder was called with correct indices
+        # For two requests: [0, 0, 1, 1, 1] (req0 has 2 beams, req1 has 3 beams)
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_called_once()
+        reorder_indices = batch.sampling_info.penalizer_orchestrator.reorder.call_args[
+            0
+        ][0]
+        expected_reorder = torch.tensor(
+            [0, 0, 1, 1, 1], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(reorder_indices, expected_reorder))
+
+        # Verify cumulate_output_tokens was called with correct tokens
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_called_once()
+        cumulated_tokens = (
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.call_args[
+                0
+            ][0]
+        )
+        expected_tokens = torch.tensor(
+            [100, 200, 300, 400, 500], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(cumulated_tokens, expected_tokens))
+
+    def test_handle_prefill_penalty_expansion_with_none_last_tokens(self):
+        """Test penalty expansion when request has None last_tokens (finished request)."""
+        device = torch.device("cpu")
+
+        # Create request with None last_tokens (finished request)
+        req1 = Mock()
+        req1.beam_width = 2
+        req1.beam_list = Mock()
+        req1.beam_list.last_tokens = None
+
+        # Create normal request
+        req2 = Mock()
+        req2.beam_width = 3
+        req2.beam_list = Mock()
+        req2.beam_list.last_tokens = torch.tensor([300, 400, 500], device=device)
+
+        batch = Mock()
+        batch.reqs = [req1, req2]
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Verify reorder was called with correct indices
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_called_once()
+        reorder_indices = batch.sampling_info.penalizer_orchestrator.reorder.call_args[
+            0
+        ][0]
+        expected_reorder = torch.tensor(
+            [0, 0, 1, 1, 1], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(reorder_indices, expected_reorder))
+
+        # Verify cumulate_output_tokens was called with zeros for finished request
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_called_once()
+        cumulated_tokens = (
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.call_args[
+                0
+            ][0]
+        )
+        expected_tokens = torch.tensor(
+            [0, 0, 300, 400, 500], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(cumulated_tokens, expected_tokens))
+
+    def test_handle_prefill_penalty_expansion_all_finished_requests(self):
+        """Test penalty expansion when all requests have None last_tokens."""
+        device = torch.device("cpu")
+
+        # Create two finished requests
+        req1 = Mock()
+        req1.beam_width = 2
+        req1.beam_list = Mock()
+        req1.beam_list.last_tokens = None
+
+        req2 = Mock()
+        req2.beam_width = 3
+        req2.beam_list = Mock()
+        req2.beam_list.last_tokens = None
+
+        batch = Mock()
+        batch.reqs = [req1, req2]
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Verify reorder was called
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_called_once()
+        reorder_indices = batch.sampling_info.penalizer_orchestrator.reorder.call_args[
+            0
+        ][0]
+        expected_reorder = torch.tensor(
+            [0, 0, 1, 1, 1], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(reorder_indices, expected_reorder))
+
+        # Verify cumulate_output_tokens was called with all zeros
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_called_once()
+        cumulated_tokens = (
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.call_args[
+                0
+            ][0]
+        )
+        expected_tokens = torch.tensor(
+            [0, 0, 0, 0, 0], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(cumulated_tokens, expected_tokens))
+
+    def test_handle_prefill_penalty_expansion_empty_batch(self):
+        """Test penalty expansion with empty batch (no requests).
+
+        Note: In practice, empty batches would typically be handled earlier in the pipeline,
+        but this test verifies the function's behavior if called with an empty batch.
+        The function will fail with torch.cat() on empty list, which is expected behavior
+        as empty batches should not reach this point in normal operation.
+        """
+        device = torch.device("cpu")
+
+        batch = Mock()
+        batch.reqs = []
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        # Empty batch will cause torch.cat() to fail, which is expected
+        with self.assertRaises(ValueError):
+            self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+    def test_handle_prefill_penalty_expansion_mixed_beam_widths(self):
+        """Test penalty expansion with requests having different beam widths."""
+        device = torch.device("cpu")
+
+        # Create requests with varying beam widths
+        req1 = Mock()
+        req1.beam_width = 1
+        req1.beam_list = Mock()
+        req1.beam_list.last_tokens = torch.tensor([100], device=device)
+
+        req2 = Mock()
+        req2.beam_width = 4
+        req2.beam_list = Mock()
+        req2.beam_list.last_tokens = torch.tensor([200, 300, 400, 500], device=device)
+
+        req3 = Mock()
+        req3.beam_width = 2
+        req3.beam_list = Mock()
+        req3.beam_list.last_tokens = torch.tensor([600, 700], device=device)
+
+        batch = Mock()
+        batch.reqs = [req1, req2, req3]
+        batch.sampling_info = Mock()
+        batch.sampling_info.penalizer_orchestrator = Mock()
+        batch.sampling_info.penalizer_orchestrator.is_required = True
+        batch.sampling_info.penalizer_orchestrator.reorder = Mock()
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens = Mock()
+
+        self.scheduler._handle_prefill_penalty_expansion(batch, device)
+
+        # Verify reorder indices: [0, 1, 1, 1, 1, 2, 2]
+        batch.sampling_info.penalizer_orchestrator.reorder.assert_called_once()
+        reorder_indices = batch.sampling_info.penalizer_orchestrator.reorder.call_args[
+            0
+        ][0]
+        expected_reorder = torch.tensor(
+            [0, 1, 1, 1, 1, 2, 2], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(reorder_indices, expected_reorder))
+
+        # Verify cumulated tokens
+        batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.assert_called_once()
+        cumulated_tokens = (
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens.call_args[
+                0
+            ][0]
+        )
+        expected_tokens = torch.tensor(
+            [100, 200, 300, 400, 500, 600, 700], dtype=torch.int64, device=device
+        )
+        self.assertTrue(torch.equal(cumulated_tokens, expected_tokens))
+
+
 if __name__ == "__main__":
     unittest.main()
