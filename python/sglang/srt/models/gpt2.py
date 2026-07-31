@@ -24,6 +24,9 @@ import torch
 from torch import nn
 from transformers import GPT2Config
 
+import torch.cuda.nvtx as nvtx
+
+from sglang.srt.distributed.parallel_state import get_tensor_model_parallel_world_size
 from sglang.srt.layers.activation import NewGELU
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -87,10 +90,12 @@ class GPT2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        nvtx.range_push("GPT2Attention")
         qkv, _ = self.c_attn(hidden_states)
         q, k, v = qkv.chunk(chunks=3, dim=-1)
         attn_output = self.attn(q, k, v, forward_batch)
         attn_output, _ = self.c_proj(attn_output)
+        nvtx.range_pop()
         return attn_output
 
 
@@ -126,9 +131,11 @@ class GPT2MLP(nn.Module):
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        nvtx.range_push("GPT2MLP")
         hidden_states, _ = self.c_fc(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states, _ = self.c_proj(hidden_states)
+        nvtx.range_pop()
         return hidden_states
 
 
@@ -164,6 +171,7 @@ class GPT2Block(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        nvtx.range_push(f"GPT2Block_layer{self.attn.attn.layer_id}")
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         attn_output = self.attn(
@@ -178,6 +186,7 @@ class GPT2Block(nn.Module):
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
+        nvtx.range_pop()
         return hidden_states
 
 
@@ -217,15 +226,21 @@ class GPT2Model(nn.Module):
         position_ids: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        nvtx.range_push("GPT2Model:embedding")
         inputs_embeds = self.wte(input_ids)
         position_embeds = self.wpe(position_ids)
         hidden_states = inputs_embeds + position_embeds
+        nvtx.range_pop()
+        nvtx.range_push("GPT2Model:layers")
 
         for i in range(len(self.h)):
             layer = self.h[i]
             hidden_states = layer(hidden_states, forward_batch)
 
+        nvtx.range_pop()
+        nvtx.range_push("GPT2Model:final_ln")
         hidden_states = self.ln_f(hidden_states)
+        nvtx.range_pop()
         return hidden_states
 
 
@@ -253,10 +268,13 @@ class GPT2LMHeadModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        nvtx.range_push("GPT2LMHeadModel")
         hidden_states = self.transformer(input_ids, positions, forward_batch)
-        return self.logits_processor(
+        result = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )
+        nvtx.range_pop()
+        return result
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters(remove_duplicate=False))

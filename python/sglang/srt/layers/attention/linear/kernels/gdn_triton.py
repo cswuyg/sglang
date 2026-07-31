@@ -56,6 +56,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        src_cache_indices: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: fuse QKV extraction + gating + recurrent
@@ -129,6 +130,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            src_ssm_state_indices=src_cache_indices,
         )
 
         # Convert [B, 1, HV, V] → [1, B, HV, V] to match existing output

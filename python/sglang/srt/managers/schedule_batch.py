@@ -74,6 +74,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
 )
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    ReqBeamSearchMixin,
+    ScheduleBatchBeamSearchMixin,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -710,7 +714,7 @@ class ReqKvInfo:
     swa_evicted_seqlen: int
 
 
-class Req(ReqDllmMixin):
+class Req(ReqDllmMixin, ReqBeamSearchMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -737,6 +741,7 @@ class Req(ReqDllmMixin):
         return_routed_experts: bool = False,
         routed_experts_start_len: int = 0,
         return_indexer_topk: bool = False,
+        is_beam_search: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -1081,6 +1086,9 @@ class Req(ReqDllmMixin):
         self.return_pooled_hidden_states = return_pooled_hidden_states
         self.pooled_hidden_state = None
 
+        # beam search (initialized via mixin)
+        self._init_beam_search_attributes(is_beam_search, self.sampling_params)
+
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
 
@@ -1096,9 +1104,14 @@ class Req(ReqDllmMixin):
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
+        # NOTE: prefill-only skips sampling, so beam search cannot be prefill-only as it requires sampling to obtain logprobs
 
-        spec_alg = get_server_args().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        server_args = get_server_args()
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and server_args.speculative_algorithm is None
+            and not server_args.enable_beam_search
+        )
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1825,7 +1838,9 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+class ScheduleBatch(
+    ScheduleBatchDisaggregationDecodeMixin, ScheduleBatchBeamSearchMixin
+):
     """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
@@ -2001,6 +2016,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Speculative decoding
     # spec_info: Optional[SpecInput] = None
     spec_info: Optional[SpecInput] = None
+
+    # === One-shot per-forward overrides; init_new consumes and resets ===
+    seq_lens_cpu_cache: torch.Tensor = None
+    capture_hidden_mode: Optional[CaptureHiddenMode] = None
+    return_hidden_states_before_norm: bool = False
+
+    def __post_init__(self):
+        self._init_beam_cascade_config()
 
     @classmethod
     def init_new(
@@ -2857,6 +2880,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
+        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
+            self.nsa_cp_metadata = None
+
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.prepare_for_beam_search_decode()
+            return
 
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
@@ -2924,6 +2953,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.filter_beam_search_batch(
+                chunked_req_to_exclude=chunked_req_to_exclude,
+                keep_indices=keep_indices,
+            )
+            return
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]
@@ -3058,6 +3094,88 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if self.spec_info:
             self.spec_info.merge_batch(other.spec_info)
 
+    def get_model_worker_batch(
+        self, seq_lens_cpu_cache: Optional[torch.Tensor] = None
+    ) -> ModelWorkerBatch:
+        if self.forward_mode.is_decode_or_idle():
+            extend_seq_lens = extend_prefix_lens = extend_logprob_start_lens = None
+        else:
+            extend_seq_lens = self.extend_lens
+            extend_prefix_lens = self.prefix_lens
+            extend_logprob_start_lens = self.extend_logprob_start_lens
+
+        if self.sampling_info:
+            if self.has_grammar:
+                self.sampling_info.grammars = [req.grammar for req in self.reqs]
+            else:
+                self.sampling_info.grammars = None
+
+        seq_lens_cpu = (
+            seq_lens_cpu_cache if seq_lens_cpu_cache is not None else self.seq_lens_cpu
+        )
+
+        return ModelWorkerBatch(
+            forward_mode=self.forward_mode,
+            input_ids=self.input_ids,
+            req_pool_indices=self.req_pool_indices,
+            seq_lens=self.seq_lens,
+            orig_seq_lens=self.orig_seq_lens,
+            out_cache_loc=self.out_cache_loc,
+            seq_lens_cpu=seq_lens_cpu,
+            seq_lens_sum=self.seq_lens_sum,
+            return_logprob=self.return_logprob,
+            top_logprobs_nums=self.top_logprobs_nums,
+            token_ids_logprobs=self.token_ids_logprobs,
+            global_num_tokens=self.global_num_tokens,
+            global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,
+            is_extend_in_batch=self.is_extend_in_batch,
+            all_extend_in_batch=self.all_extend_in_batch,
+            can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
+            tbo_split_seq_index=self.tbo_split_seq_index,
+            global_forward_mode=self.global_forward_mode,
+            extend_num_tokens=self.extend_num_tokens,
+            extend_seq_lens=extend_seq_lens,
+            extend_prefix_lens=extend_prefix_lens,
+            extend_logprob_start_lens=extend_logprob_start_lens,
+            multimodal_inputs=self.multimodal_inputs,
+            encoder_cached=self.encoder_cached,
+            encoder_lens=self.encoder_lens,
+            encoder_lens_cpu=self.encoder_lens_cpu,
+            encoder_out_cache_loc=self.encoder_out_cache_loc,
+            lora_ids=[req.lora_id for req in self.reqs],
+            sampling_info=self.sampling_info,
+            input_embeds=self.input_embeds,
+            ne_token_table=self.ne_token_table,
+            token_type_ids=self.token_type_ids,
+            spec_algorithm=self.spec_algorithm,
+            spec_info=self.spec_info,
+            hicache_consumer_index=self.hicache_consumer_index,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.return_hidden_states
+                else (
+                    getattr(
+                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    )
+                    if self.spec_info
+                    else CaptureHiddenMode.NULL
+                )
+            ),
+            extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
+            is_prefill_only=self.is_prefill_only,
+            dimensions=self.dimensions,
+            dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
+            dllm_config=self.dllm_config,
+            reqs=self.reqs,
+            has_grammar=self.has_grammar,
+            mamba_track_indices=self.mamba_track_indices,
+            mamba_track_mask=self.mamba_track_mask,
+            mamba_track_seqlens=self.mamba_track_seqlens,
+            is_beam_search=self.reqs and self.reqs[0].is_beam_search,
+            beam_shared_lens=getattr(self, "beam_shared_lens", None),
+            beam_cascade_enabled=getattr(self, "beam_cascade_enabled", False),
+        )
+
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
         # Shallow-copy the reqs list as a defensive snapshot. filter_batch and
@@ -3172,6 +3290,107 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             f"ScheduleBatch(forward_mode={self.forward_mode.name if self.forward_mode else 'None'}, "
             f"#req={(len(self.reqs))})"
         )
+
+
+@dataclasses.dataclass
+class ModelWorkerBatch:
+    # The forward mode
+    forward_mode: ForwardMode
+    # The input ids
+    input_ids: torch.Tensor
+    # The indices of requests in the req_to_token_pool
+    req_pool_indices: torch.Tensor
+    # The sequence length
+    seq_lens: torch.Tensor
+    # The indices of output tokens in the token_to_kv_pool_allocator
+    out_cache_loc: torch.Tensor
+    # The sequence length tensor on CPU
+    seq_lens_cpu: Optional[torch.Tensor]
+    seq_lens_sum: int
+
+    # For logprob
+    return_logprob: bool
+    top_logprobs_nums: Optional[List[int]]
+    token_ids_logprobs: Optional[List[List[int]]]
+
+    # For DP attention
+    global_num_tokens: Optional[List[int]]
+    global_num_tokens_for_logprob: Optional[List[int]]
+    is_extend_in_batch: bool
+    all_extend_in_batch: bool
+    can_run_dp_cuda_graph: bool
+    tbo_split_seq_index: Optional[int]
+    global_forward_mode: Optional[ForwardMode]
+
+    # For extend
+    extend_num_tokens: Optional[int]
+    extend_seq_lens: Optional[List[int]]
+    extend_prefix_lens: Optional[List[int]]
+    extend_logprob_start_lens: Optional[List[int]]
+    extend_input_logprob_token_ids: Optional[torch.Tensor]
+
+    # For multimodal
+    multimodal_inputs: Optional[List[MultimodalInputs]]
+
+    # For encoder-decoder
+    encoder_cached: Optional[List[bool]]
+    encoder_lens: Optional[torch.Tensor]
+    encoder_lens_cpu: Optional[List[int]]
+    encoder_out_cache_loc: Optional[torch.Tensor]
+
+    # For LoRA
+    lora_ids: Optional[List[str]]
+
+    # Sampling info
+    sampling_info: SamplingBatchInfo
+
+    # The original sequence lengths, Qwen-1M related
+    orig_seq_lens: Optional[torch.Tensor] = None
+
+    # The input Embeds
+    input_embeds: Optional[torch.Tensor] = None
+
+    # token table for ngram embedding
+    ne_token_table: Optional[torch.Tensor] = None
+
+    # For corss-encoder model
+    token_type_ids: Optional[torch.Tensor] = None
+
+    # Speculative decoding
+    spec_algorithm: SpeculativeAlgorithm = None
+
+    spec_info: Optional[SpecInput] = None
+
+    # If set, the output of the batch contains the hidden states of the run.
+    capture_hidden_mode: CaptureHiddenMode = None
+    hicache_consumer_index: int = -1
+
+    # For matryoshka embeddings
+    dimensions: Optional[list[int]] = None
+
+    # Whether this batch is prefill-only (no token generation needed)
+    is_prefill_only: bool = False
+
+    is_beam_search: bool = False
+    beam_shared_lens: Optional[torch.Tensor] = None
+    beam_cascade_enabled: bool = False
+
+    # Diffusion LLM
+    dllm_block_offsets: Optional[List[int]] = None
+    dllm_config: Optional[DllmConfig] = None
+
+    # For constrained decoding
+    # FIXME(lsyin): remove this after fully overlap grammar
+    reqs: Optional[List[Req]] = None
+    has_grammar: bool = False
+
+    # For hidden states before normal
+    return_hidden_states_before_norm: bool = False
+
+    # For mamba state tracking
+    mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
+    mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
+    mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
 
 
 class NextBatchPlan(msgspec.Struct):

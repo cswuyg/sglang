@@ -65,6 +65,12 @@ class BatchedRepetitionPenalizer(_BatchedPenalizer):
             keep_indices
         ]
 
+    def _reorder(self, reorder_indices: torch.Tensor):
+        self.repetition_penalties = self.repetition_penalties[reorder_indices]
+        self.cumulated_repetition_penalties = self.cumulated_repetition_penalties[
+            reorder_indices
+        ]
+
     def _merge(self, their: "BatchedRepetitionPenalizer"):
         self.repetition_penalties = torch.cat(
             [self.repetition_penalties, their.repetition_penalties], dim=0

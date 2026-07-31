@@ -1056,6 +1056,58 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.backend.cleanup()
             self.capture()
 
+    def _build_beam_cascade_replay_ctx(
+        self, forward_batch: ForwardBatch, bs: int, raw_bs: int
+    ):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            BeamCascadeReplayContext,
+        )
+
+        shared_lens = forward_batch.beam_shared_lens
+        req_offsets = forward_batch.beam_cascade_req_offsets
+        if shared_lens is None or req_offsets is None:
+            device = forward_batch.seq_lens.device
+            return BeamCascadeReplayContext(
+                shared_lens=torch.zeros(bs, dtype=torch.int32, device=device),
+                req_offsets=torch.arange(bs + 1, dtype=torch.int32, device=device),
+                shared_sig=None,
+            )
+
+        if bs > raw_bs:
+            pad_val = max(self.seq_len_fill_value - 1, 0)
+            padding = torch.full(
+                (bs - raw_bs,),
+                pad_val,
+                dtype=shared_lens.dtype,
+                device=shared_lens.device,
+            )
+            shared_lens = torch.cat([shared_lens[:raw_bs], padding])
+
+        if req_offsets.numel() < bs + 1:
+            total_beams = req_offsets[-1].item()
+            padding = torch.full(
+                (bs + 1 - req_offsets.numel(),),
+                total_beams,
+                dtype=req_offsets.dtype,
+                device=req_offsets.device,
+            )
+            req_offsets = torch.cat([req_offsets, padding])
+
+        request_ids = forward_batch.rids
+        shared_sig = (bs, tuple(request_ids)) if request_ids is not None else None
+        return BeamCascadeReplayContext(
+            shared_lens=shared_lens[:bs],
+            req_offsets=req_offsets[: bs + 1],
+            shared_sig=shared_sig,
+        )
+
+    @staticmethod
+    def _has_beam_cascade(attn_backend) -> bool:
+        if getattr(attn_backend, "beam_cascade", None) is not None:
+            return True
+        full_attn_backend = getattr(attn_backend, "full_attn_backend", None)
+        return getattr(full_attn_backend, "beam_cascade", None) is not None
+
     def load_batch(
         self,
         forward_batch: ForwardBatch,
@@ -1186,6 +1238,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             capture_forward_mode=self.capture_forward_mode,
             is_encoder_decoder=self.is_encoder_decoder,
         )
+        if self._has_beam_cascade(attn_backend):
+            attn_backend.beam_cascade_replay_ctx = self._build_beam_cascade_replay_ctx(
+                forward_batch, bs, raw_bs
+            )
         attn_backend.init_forward_metadata_out_graph(fb_view)
 
         self.raw_bs = raw_bs

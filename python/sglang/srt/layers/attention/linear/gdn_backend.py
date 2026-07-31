@@ -385,6 +385,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
+        src_cache_indices = self.forward_metadata.src_mamba_cache_indices
         # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
         # per-row write cursor. All None unless --enable-linear-replayssm, so the
         # legacy dispatch below is byte-identical when the flag is off.
@@ -405,6 +406,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.bias,
             layer.activation,
             conv_state_indices=cache_indices,
+            src_conv_state_indices=src_cache_indices,
         )
 
         # Skip split + reshape + separate gating kernel by consuming
@@ -421,6 +423,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=cache_indices,
                 num_v_heads=layer.num_v_heads,
                 head_v_dim=layer.head_v_dim,
+                src_cache_indices=src_cache_indices,
                 replayssm_d=replayssm_d,
                 replayssm_k=replayssm_k,
                 replayssm_g=replayssm_g,

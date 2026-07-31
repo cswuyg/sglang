@@ -570,6 +570,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
+    # For beam search
+    is_beam_search: bool = False
+    beam_shared_lens: Optional[torch.Tensor] = None
+    beam_cascade_enabled: bool = False
+    beam_cascade_req_offsets: Optional[torch.Tensor] = None
+
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
     # For decode context parallel.
@@ -767,6 +773,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            is_beam_search=bool(batch.reqs and batch.reqs[0].is_beam_search),
+            beam_shared_lens=getattr(batch, "beam_shared_lens", None),
+            beam_cascade_enabled=getattr(batch, "beam_cascade_enabled", False),
             # Host-side metadata
             top_logprobs_nums=batch.top_logprobs_nums,
             token_ids_logprobs=batch.token_ids_logprobs,
@@ -782,6 +791,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         ret._maybe_init_non_generation_fields(batch)
 
+        if ret.beam_cascade_enabled:
+            offsets = [0]
+            for req in batch.reqs:
+                offsets.append(offsets[-1] + req.beam_width)
+            ret.beam_cascade_req_offsets = torch.tensor(
+                offsets, dtype=torch.int32, device=model_runner.device
+            )
         device = model_runner.device
 
         if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():

@@ -26,6 +26,12 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_beam_cascade import (
+    BeamCascadeReplayContext,  # re-exported for cuda_graph_runner
+)
+from sglang.srt.layers.attention.flashinfer_beam_cascade import (
+    BeamCascadeManager,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -148,6 +154,10 @@ class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+
+    # shared 部分使用 prefill，因为这是一份 KV 对多个 Q，private 部分使用 decode，因为这是一份 KV 对一个 Q
+    cascade_shared_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
+    cascade_private_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
 
 
 @dataclass
@@ -525,6 +535,22 @@ class FlashInferAttnBackend(AttentionBackend):
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
 
+        self.beam_cascade: Optional[BeamCascadeManager] = None
+        if (
+            model_runner.server_args.enable_beam_cascade_attention
+            and self.num_wrappers == 1
+        ):
+            self.beam_cascade = BeamCascadeManager(self, model_runner)
+
+    @property
+    def beam_cascade_replay_ctx(self) -> Optional[BeamCascadeReplayContext]:
+        return self.beam_cascade.replay_ctx if self.beam_cascade else None
+
+    @beam_cascade_replay_ctx.setter
+    def beam_cascade_replay_ctx(self, value: Optional[BeamCascadeReplayContext]):
+        if self.beam_cascade:
+            self.beam_cascade.replay_ctx = value
+
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
             return
@@ -717,17 +743,33 @@ class FlashInferAttnBackend(AttentionBackend):
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
         if forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                req_pool_indices[:bs],
-                seq_lens[:bs],
-                seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
-                seq_lens_sum,
-                decode_wrappers=self.decode_cuda_graph_metadata[bs],
-                encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
-                spec_info=spec_info,
-                fixed_split_size=None,
-                disable_split_kv=self.disable_cuda_graph_kv_split,
-            )
+            decode_wrappers = self.decode_cuda_graph_metadata[bs]
+            use_cascade = False
+            if self.beam_cascade:
+                if in_capture:
+                    use_cascade = self.beam_cascade.capture(
+                        bs,
+                        forward_batch.positions.numel(),
+                        req_pool_indices[:bs],
+                        seq_lens[:bs],
+                        decode_wrappers,
+                    )
+                else:
+                    use_cascade = self.beam_cascade.replay(
+                        bs, req_pool_indices[:bs], seq_lens[:bs], seq_lens_cpu
+                    )
+            if not use_cascade:
+                self.indices_updater_decode.update(
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    seq_lens_cpu[:bs] if seq_lens_cpu is not None else None,
+                    seq_lens_sum,
+                    decode_wrappers=decode_wrappers,
+                    encoder_lens=encoder_lens[:bs] if encoder_lens is not None else None,
+                    spec_info=spec_info,
+                    fixed_split_size=None,
+                    disable_split_kv=self.disable_cuda_graph_kv_split,
+                )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
@@ -765,12 +807,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
         elif forward_mode.is_extend():
-            # Plain EXTEND under full prefill CUDA graph. plan() runs
-            # out-of-graph against capture-stable wrappers; captured kernels
-            # read the refreshed state at replay. Must stay below the
-            # target-verify / draft-extend / dllm branches (also is_extend()).
-            # Split-kv must stay on — its block_valid_mask is the only
-            # early-exit for the captured fixed grid's padded/stale tiles.
             self.indices_updater_prefill.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -786,8 +822,6 @@ class FlashInferAttnBackend(AttentionBackend):
             raise ValueError("Invalid forward mode")
 
         if in_capture and forward_mode.is_decode_or_idle():
-            # fast_decode_plan needs _cached_module from the initial begin_forward
-            # above, so install it only after that first plan has run.
             for w in self.decode_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_decode_plan, w)
 
@@ -795,18 +829,11 @@ class FlashInferAttnBackend(AttentionBackend):
             in_capture
             and forward_mode.is_draft_extend_v2()
             and self.prefill_backend == "fa2"
-            # Host-rebuilt layout only matches full attention (single wrapper);
-            # SWA/cross-attn keep the plain plan().
             and self.dispatch_reason is None
         ):
-            # Like decode: swap in fast_prefill_plan for replay, after the real
-            # plan() above set up _cached_module (host metadata supplied per-replay
-            # in call_begin_forward).
             for w in self.draft_extend_cuda_graph_metadata[bs]:
                 w.begin_forward = partial(fast_prefill_plan, w)
 
-        # Refill the SWA write-target buffer from the live out_cache_loc before
-        # replay (bound onto the metadata at capture below).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             assert self._swa_kv_pool is not None
             n = forward_batch.out_cache_loc.shape[0]
@@ -910,20 +937,21 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
-            self.indices_updater_decode.update(
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                forward_batch.seq_lens_cpu,
-                forward_batch.seq_lens_sum,
-                decode_wrappers=self.decode_wrappers,
-                encoder_lens=forward_batch.encoder_lens,
-                spec_info=forward_batch.spec_info,
-                fixed_split_size=self.decode_split_tile_size,
-                disable_split_kv=False,
-            )
-            self.forward_metadata = DecodeMetadata(
-                self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
-            )
+            if not (self.beam_cascade and self.beam_cascade.plan_eager(forward_batch)):
+                self.indices_updater_decode.update(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                    forward_batch.seq_lens_cpu,
+                    forward_batch.seq_lens_sum,
+                    decode_wrappers=self.decode_wrappers,
+                    encoder_lens=forward_batch.encoder_lens,
+                    spec_info=forward_batch.spec_info,
+                    fixed_split_size=self.decode_split_tile_size,
+                    disable_split_kv=False,
+                )
+                self.forward_metadata = DecodeMetadata(
+                    self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+                )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -944,15 +972,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
-
-            # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
             if self.is_multimodal or self.enable_mis:
-                # use_ragged = False: Multi-item scoring requires the paged wrapper because:
-                # 1. Ragged wrapper doesn't support the specialized multi-item parameters
-                #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
-                # 2. Paged wrapper provides better control over attention masking needed
-                #    for respecting item boundaries in multi-item sequences
-                # 3. Custom masking logic conflicts with ragged wrapper's assumptions
                 use_ragged = False
                 extend_no_prefix = False
             else:
@@ -963,10 +983,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
                 extend_no_prefix = not any(forward_batch.extend_prefix_lens_cpu)
 
-            # Process multi-item scoring in attention backend instead of ForwardBatch
             multi_item_params = MultiItemScoringParams()
             if self.enable_mis:
-                # Use new backend-specific implementation
                 multi_item_params = self._process_multi_item_scoring(forward_batch)
 
             self._prepare_dequant_workspace_metadata_for_extend(
@@ -1029,6 +1047,9 @@ class FlashInferAttnBackend(AttentionBackend):
             # Force allocation by performing a small operation
             if len(self.cuda_graph_kv_indices[i]) > 0:
                 self.cuda_graph_kv_indices[i][0] = 0
+
+        if self.beam_cascade:
+            self.beam_cascade.init_cuda_graph_buffers(max_bs, max_num_tokens)
 
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
@@ -1424,6 +1445,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     *self._kv_write_scales(layer),
                 )
 
+        q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+
         if self.decode_uses_dequant_workspace:
             kv_cache = (
                 self.token_to_kv_pool.get_flashinfer_decode_dequant_workspace_kv_buffer(
@@ -1440,16 +1463,19 @@ class FlashInferAttnBackend(AttentionBackend):
         else:
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            kv_cache,
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        if self.beam_cascade:
+            o = self.beam_cascade.run_decode(layer, q_reshaped, kv_cache)
+        else:
+            # Call the wrapped function
+            o = decode_wrapper.forward(
+                q_reshaped,
+                kv_cache,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 

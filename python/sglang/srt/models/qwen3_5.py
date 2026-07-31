@@ -19,8 +19,22 @@ from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn as nn
 import triton
+
+
+def _nvtx_range_push(msg: str):
+    """Conditionally push NVTX range, skipping during torch.compile tracing."""
+    if not torch.compiler.is_compiling():
+        nvtx.range_push(msg)
+
+
+def _nvtx_range_pop():
+    """Conditionally pop NVTX range, skipping during torch.compile tracing."""
+    if not torch.compiler.is_compiling():
+        nvtx.range_pop()
+
 
 # Layers - Attention
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
@@ -628,6 +642,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         2. Core attention (custom op)
         3. Output projection
         """
+        _nvtx_range_push("Qwen3_5GatedDeltaNet")
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
             hidden_states
         )
@@ -682,6 +697,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         output, _ = self.out_proj(core_attn_out)
+        _nvtx_range_pop()
         return output
 
 
@@ -775,6 +791,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
+        _nvtx_range_push("Qwen3_5LinearDecoderLayer")
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -824,6 +841,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        _nvtx_range_pop()
         return hidden_states, residual
 
 
@@ -1172,6 +1190,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
         **kwargs,
     ):
+        _nvtx_range_push("Qwen3_5AttentionDecoderLayer")
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
@@ -1219,6 +1238,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
+        _nvtx_range_pop()
         return hidden_states, residual
 
 
@@ -1415,6 +1435,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         # Initialize hidden states
+        _nvtx_range_push("Qwen3_5ForCausalLM:embedding")
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -1425,9 +1446,11 @@ class Qwen3_5ForCausalLM(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+        _nvtx_range_pop()
 
         aux_hidden_states = []
         # Pass through decoder layers
+        _nvtx_range_push("Qwen3_5ForCausalLM:layers")
         for layer_idx in range(self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
             with get_global_expert_distribution_recorder().with_current_layer(
@@ -1456,6 +1479,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
                 )
 
+        _nvtx_range_pop()
+
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -1466,11 +1491,13 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         # Apply final normalization
+        _nvtx_range_push("Qwen3_5ForCausalLM:final_norm")
         if hidden_states.shape[0] != 0:
             if residual is None:
                 hidden_states = self.norm(hidden_states)
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
+        _nvtx_range_pop()
 
         if len(aux_hidden_states) == 0:
             return hidden_states

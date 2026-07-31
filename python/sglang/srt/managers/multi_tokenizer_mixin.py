@@ -176,20 +176,14 @@ def _handle_output_by_index(output, i):
             decode_ids=_extract_field_by_index(output, "decode_ids", i),
             read_offsets=_extract_field_by_index(output, "read_offsets", i),
             output_ids=_extract_field_by_index(output, "output_ids", i),
-            skip_special_tokens=_extract_field_by_index(
-                output, "skip_special_tokens", i
-            ),
-            spaces_between_special_tokens=_extract_field_by_index(
-                output, "spaces_between_special_tokens", i
-            ),
+            skip_special_tokens=_extract_field_by_index(output, "skip_special_tokens", i),
+            spaces_between_special_tokens=_extract_field_by_index(output, "spaces_between_special_tokens", i),
             no_stop_trim=_extract_field_by_index(output, "no_stop_trim", i),
             prompt_tokens=_extract_field_by_index(output, "prompt_tokens", i),
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
-            ),
+            cached_tokens_details=_extract_field_by_index(output, "cached_tokens_details", i),
             image_tokens=_extract_field_by_index(output, "image_tokens", i),
             audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
             video_tokens=_extract_field_by_index(output, "video_tokens", i),
@@ -250,12 +244,9 @@ def _handle_output_by_index(output, i):
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
-            customized_info=_extract_field_by_index(
-                output, "customized_info", i, check_length=False
-            ),
+            beam_search_output=_extract_field_by_index(output, "beam_search_output", i, check_length=True),
+            token_steps=_extract_field_by_index(output, "token_steps", i, check_length=False),
+            customized_info=_extract_field_by_index(output, "customized_info", i, check_length=False),
             dp_ranks=_extract_field_by_index(output, "dp_ranks", i, check_length=False),
         )
     elif isinstance(output, BatchEmbeddingOutput):
@@ -295,9 +286,7 @@ def _handle_output_by_index(output, i):
             completion_tokens=_extract_field_by_index(output, "completion_tokens", i),
             reasoning_tokens=_extract_field_by_index(output, "reasoning_tokens", i),
             cached_tokens=_extract_field_by_index(output, "cached_tokens", i),
-            cached_tokens_details=_extract_field_by_index(
-                output, "cached_tokens_details", i
-            ),
+            cached_tokens_details=_extract_field_by_index(output, "cached_tokens_details", i),
             image_tokens=_extract_field_by_index(output, "image_tokens", i),
             audio_tokens=_extract_field_by_index(output, "audio_tokens", i),
             video_tokens=_extract_field_by_index(output, "video_tokens", i),
@@ -362,9 +351,8 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
-            token_steps=_extract_field_by_index(
-                output, "token_steps", i, check_length=False
-            ),
+            beam_search_output=_extract_field_by_index(output, "beam_search_output", i, check_length=True),
+            token_steps=_extract_field_by_index(output, "token_steps", i, check_length=False),
         )
     else:
         new_output = output

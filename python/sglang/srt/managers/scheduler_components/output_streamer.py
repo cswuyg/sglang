@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Callable,
@@ -18,6 +18,7 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchTokenIDOutput,
+    BeamSearchOutput,
     CachedTokensDetails,
     wrap_as_pickle,
 )
@@ -293,6 +294,7 @@ class _GenerationStreamAccumulator:
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
+    beam_search_output: list = field(default_factory=list)
     input_token_logprobs_val: Optional[list] = None
     input_token_logprobs_idx: Optional[list] = None
     output_token_logprobs_val: Optional[list] = None
@@ -391,6 +393,27 @@ class _GenerationStreamAccumulator:
         self.prompt_tokens.append(len(req.origin_input_ids))
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
+
+        if getattr(req, "is_beam_search", False):
+            self.completion_tokens[-1] = sum(
+                len(beam_seq.tokens) for beam_seq in req.beam_list.completed
+            )
+            self.beam_search_output.append(
+                BeamSearchOutput(
+                    sequences=[
+                        replace(
+                            beam_seq,
+                            finish_reason=(
+                                beam_seq.finish_reason.to_json()
+                                if beam_seq.finish_reason
+                                else None
+                            ),
+                        )
+                        for beam_seq in req.beam_list.completed
+                    ]
+                )
+            )
+
         self.cached_tokens.append(req.cached_tokens)
 
         # Collect detailed cache breakdown if available
@@ -608,5 +631,8 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            beam_search_output=(
+                self.beam_search_output if self.beam_search_output else None
+            ),
             dp_ranks=dp_ranks,
         )

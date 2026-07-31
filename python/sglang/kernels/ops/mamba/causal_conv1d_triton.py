@@ -580,6 +580,7 @@ def _causal_conv1d_update_kernel(
     conv_state_ptr,
     cache_seqlens_ptr,  # circular buffer
     conv_state_indices_ptr,
+    src_conv_state_indices_ptr,
     num_accept_tokens_ptr,
     intermediate_conv_window_ptr,
     intermediate_state_indices_ptr,
@@ -631,6 +632,7 @@ def _causal_conv1d_update_kernel(
     BLOCK_N: tl.constexpr,
     SAVE_INTERMEDIATE: tl.constexpr,
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
+    HAS_SRC_CONV_STATE_INDICES: tl.constexpr,
     USE_GDC: tl.constexpr = False,
 ):
     # ruff: noqa: E501
@@ -649,6 +651,13 @@ def _causal_conv1d_update_kernel(
         conv_state_batch_coord = tl.load(
             conv_state_indices_ptr + idx_seq * stride_state_indices
         ).to(tl.int64)
+        # src coord for reading old conv state (COW beam search)
+        if HAS_SRC_CONV_STATE_INDICES:
+            src_conv_state_batch_coord = tl.load(
+                src_conv_state_indices_ptr + idx_seq * stride_state_indices
+            ).to(tl.int64)
+        else:
+            src_conv_state_batch_coord = conv_state_batch_coord
         if SAVE_INTERMEDIATE:
             intermediate_state_batch_coord = tl.load(
                 intermediate_state_indices_ptr
@@ -656,6 +665,7 @@ def _causal_conv1d_update_kernel(
             ).to(tl.int64)
     else:
         conv_state_batch_coord = idx_seq
+        src_conv_state_batch_coord = idx_seq
     if USE_PAD_SLOT:  # noqa
         if conv_state_batch_coord == pad_slot_id:
             # not processing as this is not the actual sequence
@@ -679,10 +689,10 @@ def _causal_conv1d_update_kernel(
     else:
         conv_state_token_offset = 0
 
-    # STEP 1: READ init_state data
+    # STEP 1: READ init_state data (from SRC coord for COW beam search)
     conv_states_base = (
         conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (src_conv_state_batch_coord * stride_conv_state_seq)
         + (idx_feats * stride_conv_state_dim)
     )
     mask_w = idx_feats < dim
@@ -709,7 +719,7 @@ def _causal_conv1d_update_kernel(
     # load since idx_tokens + 1.
     conv_state_ptrs_source = (
         conv_state_ptr
-        + (conv_state_batch_coord * stride_conv_state_seq)
+        + (src_conv_state_batch_coord * stride_conv_state_seq)
         + conv_state_token_offset * stride_conv_state_tok
         + (idx_feats * stride_conv_state_dim)[None, :]
         + ((idx_tokens + (1 if IS_SPEC_DECODING else seqlen)) * stride_conv_state_tok)[
@@ -717,7 +727,7 @@ def _causal_conv1d_update_kernel(
         ]
     )  # [BLOCK_M, BLOCK_N]
     mask = (
-        (conv_state_batch_coord < num_cache_lines)
+        (src_conv_state_batch_coord < num_cache_lines)
         & ((idx_tokens + seqlen) < state_len)[:, None]
         & (idx_feats < dim)[None, :]
     )
@@ -996,6 +1006,7 @@ def causal_conv1d_update(
     activation: Union[bool, str, None] = None,
     cache_seqlens: Optional[torch.Tensor] = None,
     conv_state_indices: Optional[torch.Tensor] = None,
+    src_conv_state_indices: Optional[torch.Tensor] = None,
     num_accept_tokens: Optional[torch.Tensor] = None,
     intermediate_conv_window: Optional[torch.Tensor] = None,
     intermediate_state_indices: Optional[torch.Tensor] = None,
@@ -1061,6 +1072,12 @@ def causal_conv1d_update(
             assert (batch,) == conv_state_indices.shape
             assert intermediate_state_indices is not None
             assert (batch,) == intermediate_state_indices.shape
+        if src_conv_state_indices is not None:
+            assert conv_state_indices is not None, (
+                "src_conv_state_indices (COW) requires conv_state_indices "
+                "(continuous batching); otherwise read/write cannot be separated."
+            )
+            assert (batch,) == src_conv_state_indices.shape
 
         assert num_cache_lines >= batch
         assert weight.stride(1) == 1  # Need this
@@ -1143,6 +1160,7 @@ def causal_conv1d_update(
         conv_state,
         cache_seqlens,
         conv_state_indices,
+        src_conv_state_indices,
         num_accept_tokens,
         intermediate_conv_window if intermediate_conv_window is not None else x,
         intermediate_state_indices,
@@ -1194,6 +1212,7 @@ def causal_conv1d_update(
         BLOCK_N=256,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_EAGLE_TREE_CUSTOM_ATTN_MASK=retrieve_next_token is not None,
+        HAS_SRC_CONV_STATE_INDICES=src_conv_state_indices is not None,
         **pdl_kwargs,
     )
     if unsqueeze:

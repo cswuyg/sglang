@@ -52,6 +52,9 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.beam_search_tokenizer_manager_mixin import (
+    BeamSearchTokenizerManagerMixin,
+)
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -320,7 +323,11 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
-class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+class TokenizerManager(
+    BeamSearchTokenizerManagerMixin,
+    TokenizerControlMixin,
+    TokenizerManagerScoreMixin,
+):
     """TokenizerManager is a process that tokenizes the text."""
 
     @property
@@ -1606,6 +1613,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 out = out_list[-1]
 
+            # If this is a beam search result, convert it to a regular out dict so
+            # all subsequent finished/logging/metrics logic is shared automatically.
+            if out.get("beam_results"):
+                if not finished:
+                    # Intermediate beam search output — skip until finished
+                    continue
+                out = self.build_beam_search_out(out)
+
             # Resolve deferred text for non-incremental streaming.
             # _handle_batch_output sets "text": None on intermediate chunks
             # to avoid O(n) string rebuild per step (O(n^2) total).
@@ -2106,7 +2121,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 meta_info["dp_rank"] = recv_obj.dp_ranks[i]
 
             state.finished = recv_obj.finished_reasons[i] is not None
-            if isinstance(recv_obj, BatchStrOutput):
+
+            # Build beam search out dict after meta_info is fully populated.
+            beam_out_dict = self.try_build_beam_search_out_dict(recv_obj, i, meta_info)
+            if beam_out_dict is not None:
+                out_dict = beam_out_dict
+            elif isinstance(recv_obj, BatchStrOutput):
                 # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
                 is_stream = getattr(state.obj, "stream", False)
                 incremental = is_stream and self.incremental_streaming_output

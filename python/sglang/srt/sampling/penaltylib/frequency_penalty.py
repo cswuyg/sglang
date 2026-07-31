@@ -1,6 +1,10 @@
+import logging
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
+
+logger = logging.getLogger(__name__)
 
 
 class BatchedFrequencyPenalizer(_BatchedPenalizer):
@@ -46,6 +50,12 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
         self.frequency_penalties = self.frequency_penalties[keep_indices]
         self.cumulated_frequency_penalties = self.cumulated_frequency_penalties[
             keep_indices
+        ]
+
+    def _reorder(self, reorder_indices: torch.Tensor):
+        self.frequency_penalties = self.frequency_penalties[reorder_indices]
+        self.cumulated_frequency_penalties = self.cumulated_frequency_penalties[
+            reorder_indices
         ]
 
     def _merge(self, their: "BatchedFrequencyPenalizer"):

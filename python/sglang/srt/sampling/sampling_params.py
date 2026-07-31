@@ -80,6 +80,7 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     logit_bias: Optional[Dict[str, float]] = None
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
+    use_beam_search: bool = False
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -134,6 +135,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.no_stop_trim if self.no_stop_trim is not None else False
         )
 
+        self.use_beam_search = (
+            self.use_beam_search if self.use_beam_search is not None else False
+        )
         # Process some special cases
         if 0 <= self.temperature < _SAMPLING_EPS:
             # top_k = 1 means greedy sampling

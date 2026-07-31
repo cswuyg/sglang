@@ -51,10 +51,12 @@ from pydantic import PlainValidator
 
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.managers.beam_search_type import BeamSearchSequence
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
@@ -94,6 +96,10 @@ class BaseBatchReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
     @classmethod
     def __get_pydantic_core_schema__(cls, source, handler):
         return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
+class BeamSearchOutput(BaseBatchReq, kw_only=True):
+    sequences: List[BeamSearchSequence]
 
 
 class PickleWrapper(msgspec.Struct, tag=True, array_like=True):
@@ -419,6 +425,47 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _handle_beam_search_parallel_sampling(self) -> int:
+        """Override parallel sampling to 1 when beam search is enabled and check that n (beam_width) must be greater than 1.
+
+        Beam search is activated per-request via use_beam_search in sampling_params,
+        but the server must also have enable_beam_search=True as a global switch.
+        """
+        # Check per-request use_beam_search flag first
+        use_beam_search = False
+        if isinstance(self.sampling_params, dict):
+            use_beam_search = self.sampling_params.get("use_beam_search", False)
+        elif isinstance(self.sampling_params, list) and len(self.sampling_params) > 0:
+            use_beam_search = self.sampling_params[0].get("use_beam_search", False)
+
+        if not use_beam_search:
+            return self.parallel_sample_num
+
+        # If user requested beam search, the global switch must be enabled.
+        try:
+            enable_beam_search = get_global_server_args().enable_beam_search
+        except ValueError:
+            enable_beam_search = False
+        if not enable_beam_search:
+            logger.error(
+                "Beam search is requested (use_beam_search=True) but the server was "
+                "started without --enable-beam-search."
+            )
+            raise ValueError(
+                "Beam search is requested (use_beam_search=True) but the server was "
+                "started without --enable-beam-search. "
+                "Please add --enable-beam-search when launching the server."
+            )
+
+        # When using beam search, parallel sampling does not perform diffusion at the tokenizer layer,
+        # but instead performs beam diffusion at the Scheduler layer
+        if self.parallel_sample_num <= 1:
+            raise ValueError(
+                f"Beam search mode requires n > 1 (beam_width), but got n={self.parallel_sample_num}. "
+                "Please set n to a value greater than 1 in sampling_params."
+            )
+        return 1
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -434,6 +481,8 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -1290,6 +1339,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
 
+    # beam search
+    beam_search_output: List[BeamSearchOutput] = None
+
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None
 
@@ -1371,6 +1423,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Number of times each request was retracted.
     retraction_counts: Optional[List[int]] = None
+
+    # beam search
+    beam_search_output: List[BeamSearchOutput] = None
 
     # The trainer step id. Used to know which step's weights are used for sampling.
     token_steps: Optional[List[List[int]]] = None

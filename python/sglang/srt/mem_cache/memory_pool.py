@@ -316,10 +316,30 @@ class ReqToTokenPool:
                 offset += 1
         return [r.req_pool_idx for r in reqs]
 
+    def alloc_by_count(self, n: int) -> Optional[List[int]]:
+        """Allocate n slots and return their raw indices without touching any Req object.
+
+        This is the low-level counterpart of alloc() for callers (e.g. beam search)
+        that need bare pool slots not associated with a specific Req.
+        """
+        if n > len(self.free_slots):
+            return None
+        indices = self.free_slots[:n]
+        self.free_slots = self.free_slots[n:]
+        return indices
+
     def free(self, req: Req):
         assert req.req_pool_idx is not None, "request must have req_pool_idx"
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
+
+    def free_by_indices(self, indices: List[int]):
+        """Free slots by raw pool indices without a Req object.
+
+        This is the low-level counterpart of free() for callers (e.g. beam search)
+        that hold bare pool indices rather than Req objects.
+        """
+        self.free_slots.extend(indices)
 
     def clear(self):
         self.free_slots = list(range(1, self._alloc_size))
@@ -1018,6 +1038,13 @@ class MambaPool:
             )
         current_platform.synchronize()
 
+    def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
+        dst_index = self.alloc(1)
+        if dst_index is None:
+            return None
+        self.copy_from(src_index, dst_index)
+        return dst_index
+
     _NON_TRANSFER_STATE_FIELDS = frozenset(
         {
             "intermediate_ssm",
@@ -1221,6 +1248,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
         )
+
+        # req_pool_index -> source mamba slot to read in COW forward, one-shot per prune.
+        self.beam_cow_read_mapping: Optional[torch.Tensor] = None
+        # COW source slots to free after their read is consumed by next decode.
+        self.beam_cow_source_slots: Optional[torch.Tensor] = None
+
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
@@ -1330,6 +1363,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
         before calling the pool's physical-id state ops (copy_from / clear_slots
         / get_cpu_copy / load_cpu_copy)."""
         return mamba_indices
+
+    def get_beam_cow_read_mapping(self, req_indices: torch.Tensor):
+        if self.beam_cow_read_mapping is None:
+            return None
+        return self.beam_cow_read_mapping[req_indices]
+
+    def set_beam_cow_read_mapping(
+        self, req_pool_indices: torch.Tensor, src_mamba_idx: torch.Tensor
+    ):
+        if self.beam_cow_read_mapping is None:
+            self.beam_cow_read_mapping = self.req_index_to_mamba_index_mapping.clone()
+        self.beam_cow_read_mapping[req_pool_indices] = src_mamba_idx
+
+    def clear_beam_cow_read_mapping(self):
+        self.beam_cow_read_mapping = None
+
+    def flush_beam_cow_source_slots(self):
+        if self.beam_cow_source_slots is not None:
+            if self.beam_cow_source_slots.numel() > 0:
+                self.mamba_allocator.free(self.beam_cow_source_slots)
+            self.beam_cow_source_slots = None
+
+    def stage_beam_cow_source_slots(self, slots: torch.Tensor):
+        if slots.numel() == 0:
+            return
+        slots = slots.to(dtype=self.mamba_allocator.free_slots.dtype)
+        if self.beam_cow_source_slots is None:
+            self.beam_cow_source_slots = slots
+        else:
+            self.beam_cow_source_slots = torch.cat((self.beam_cow_source_slots, slots))
 
     def mamba2_layer_cache(self, layer_id: int):
         assert layer_id in self.mamba_map
@@ -1495,6 +1558,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if self.mamba_ckpt_pool is not None:
             self.mamba_ckpt_pool.clear()
         self.req_index_to_mamba_index_mapping.zero_()
+        self.beam_cow_read_mapping = None
+        self.beam_cow_source_slots = None
         if self.enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
 

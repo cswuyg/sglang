@@ -3,6 +3,7 @@ from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed as dist
 from torch import nn
 
@@ -100,6 +101,7 @@ class Sampler(nn.Module):
         top_logprobs_nums: List[int],
         token_ids_logprobs: List[List[int]],
         positions: torch.Tensor,
+        is_beam_search: bool,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
 
@@ -116,6 +118,22 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        if is_beam_search:
+            # beam search 只在此处计算 logprobs，采样逻辑由外部处理。
+            # 注意：penalty / logit_bias 等已在 model_runner._preprocess_logits
+            # （即 apply_logits_bias）中施加到 logits 上，这里无需重复处理。
+            #
+            # TODO(cswuyg)：以下 sampler 内的 _preprocess_logits 暂不在此调用，原因：
+            #   1、这里的 _preprocess_logits 未适配 beam width，custom logit processor 功能不可用；
+            #   2、beam search 需要多个请求的候选合并对比，必须使用 logprob 才公平；
+            #   3、原因可以参考 hf transformers 的 PrefixConstrainedLogitsProcessor。
+            # logits = self._preprocess_logits(logits, sampling_info)
+            nvtx.range_push("beam_search:log_softmax")
+            logprobs = torch.nn.functional.log_softmax(logits, dim=-1)
+            logits_output.logprobs = logprobs
+            nvtx.range_pop()  # beam_search:log_softmax
+            return None
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)

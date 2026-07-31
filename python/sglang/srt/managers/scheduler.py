@@ -34,6 +34,7 @@ suppress_noisy_warnings()
 import psutil  # isort: skip
 import setproctitle
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.distributed
 from torch.cuda import Stream as CudaStream
 from torch.distributed import barrier
@@ -179,6 +180,9 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+)
+from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+    SchedulerBeamSearchProcessorMixin,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -336,6 +340,7 @@ _is_hip = is_hip()
 
 
 class Scheduler(
+    SchedulerBeamSearchProcessorMixin,
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
     SchedulerMultiplexMixin,
@@ -583,7 +588,20 @@ class Scheduler(
 
         self.init_weight_updater()
 
+
         # Init request dispatcher
+
+        # Initialize beam search constraint processor
+        self.beam_search_constraint = None
+        if self.server_args.beam_search_constraint_dict:
+            self._init_beam_search_constraint()
+
+        # Zero-copy mamba/conv state prune via double buffering (Copy-on-Write).
+        self.enable_beam_mamba_double_buffer = (
+            self.server_args.enable_beam_search
+            and self.server_args.enable_beam_mamba_double_buffer
+        )
+
         self.init_request_dispatcher()
 
         # Init LoRA drainer for fair scheduling
@@ -1392,6 +1410,63 @@ class Scheduler(
             get_int_env_var(env_var, default_size) if env_var else None
         )
 
+    def _init_beam_search_constraint(self):
+        """Initialize beam search constraint trie if configured."""
+        from sglang.srt.managers.prefix_constrained_processor import (
+            PrefixConstrainedProcessor,
+        )
+        from sglang.srt.managers.prefix_constrained_trie import (
+            build_trie_from_dict,
+            load_trie_from_pickle,
+        )
+
+        dict_path = self.server_args.beam_search_constraint_dict
+        tokenizer_path = getattr(self.tokenizer, "name_or_path", "")
+
+        # Try to load from pickle first
+        trie = load_trie_from_pickle(dict_path)
+
+        if trie is None:
+            if not tokenizer_path:
+                logger.warning(
+                    f"[Beam Search] Tokenizer path unavailable and no pickle trie found, "
+                    f"constraint disabled for dict_path: {dict_path}"
+                )
+                return
+            logger.info(
+                f"[Beam Search] Building constraint trie from raw dict {dict_path}"
+            )
+            trie = build_trie_from_dict(
+                dict_path=dict_path, tokenizer_path=tokenizer_path
+            )
+
+        if trie is None:
+            return
+
+        logger.info(
+            f"[Beam Search] Constraint trie built: "
+            f"sequences={trie.num_sequences} nodes={trie.num_nodes} "
+            f"max_depth={trie.max_depth}"
+        )
+
+        # Parse EOS token IDs
+        eos_set = set()
+        eos_ids = self.model_config.hf_eos_token_id
+        if isinstance(eos_ids, (set, frozenset, list, tuple)):
+            eos_set.update(int(x) for x in eos_ids)
+        elif eos_ids is not None:
+            eos_set.add(int(eos_ids))
+        if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
+            eos_set.add(int(self.tokenizer.eos_token_id))
+
+        self.beam_search_constraint = PrefixConstrainedProcessor(
+            trie=trie,
+            vocab_size=self.model_config.vocab_size,
+            eos_token_ids=eos_set,
+            device=self.device,
+        )
+
+
     def init_request_dispatcher(self):
         self._request_dispatcher = TypeBasedDispatcher(
             [
@@ -1580,27 +1655,38 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
+            nvtx.range_push("event_loop_normal:iter")
             if self.gracefully_exit:
+                nvtx.range_pop()
                 break
 
             # Receive requests
+            nvtx.range_push("event_loop_normal:recv_requests")
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
+            nvtx.range_pop()  # event_loop_normal:recv_requests
             if self._engine_paused:
+                nvtx.range_pop()  # event_loop_normal:iter
                 continue
 
             # Get the next batch to run
+            nvtx.range_push("event_loop_normal:get_next_batch")
             plan = self.get_next_batch_to_run(
                 running_batch=self.running_batch, last_batch=self.last_batch
             )
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
+            nvtx.range_pop()  # event_loop_normal:get_next_batch
 
             # Launch the current batch
             if batch:
+                nvtx.range_push("event_loop_normal:run_batch")
                 result = self.run_batch(batch)
+                nvtx.range_pop()  # event_loop_normal:run_batch
+                nvtx.range_push("event_loop_normal:process_batch_result")
                 self.process_batch_result(batch, result)
+                nvtx.range_pop()  # event_loop_normal:process_batch_result
             else:
                 # When the server is idle, do self-check and re-init some states.
                 self.on_idle()
@@ -1609,6 +1695,7 @@ class Scheduler(
             self.last_batch = batch
             if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
                 self.invariant_checker.self_check_during_busy()
+            nvtx.range_pop()  # event_loop_normal:iter
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2174,13 +2261,24 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # Check if beam search is enabled from request sampling params
+            is_beam_search = (
+                self.server_args.enable_beam_search
+                and recv_req.sampling_params.use_beam_search
+                and recv_req.sampling_params.n > 1
+            )
+
+            if is_beam_search:
+                nvtx.range_push("beam_search:create_req")
+
+            # beam search not support return logprob
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob if not is_beam_search else False,
+                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
@@ -2195,6 +2293,7 @@ class Scheduler(
                 return_routed_experts=recv_req.return_routed_experts,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_indexer_topk=recv_req.return_indexer_topk,
+                is_beam_search=is_beam_search,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2217,6 +2316,9 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+
+            if is_beam_search:
+                nvtx.range_pop()  # beam_search:create_req
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -2853,8 +2955,16 @@ class Scheduler(
             if running_batch.is_empty():
                 running_batch.batch_is_full = False
 
+
+        # Whether there is decode work available on the current running batch.
+        can_decode = (
+            not running_batch.is_empty() and not running_batch.is_prefill_only
+        )
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
+        elif self.server_args.enable_decode_first and can_decode:
+            # Decode-First: prioritize decode this round and skip prefill.
+            new_batch = None
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -3051,6 +3161,14 @@ class Scheduler(
                     or not adder.preempt_to_schedule(req, self.server_args)
                 ):
                     break
+
+            # Ensure all requests in the batch have the same beam search type
+            if len(self.running_batch.reqs) > 0:
+                if req.is_beam_search != self.running_batch.reqs[0].is_beam_search:
+                    continue
+            if len(adder.can_run_list) > 0:
+                if req.is_beam_search != adder.can_run_list[0].is_beam_search:
+                    continue
 
             if self.enable_hicache_storage:
                 prefetch_done = self.tree_cache.check_prefetch_progress(req.rid)
@@ -3644,6 +3762,32 @@ class Scheduler(
         if batch_result.logits_output is not None:
             batch_result.logits_output.next_token_logits = None
 
+    @property
+    def current_scheduler_metrics_enabled(self):
+        return self.metrics_reporter.current_scheduler_metrics_enabled
+
+    @property
+    def num_generated_tokens(self):
+        return self.metrics_reporter.num_generated_tokens
+
+    @num_generated_tokens.setter
+    def num_generated_tokens(self, value):
+        self.metrics_reporter.num_generated_tokens = value
+
+    @property
+    def forward_ct_decode(self):
+        return self.metrics_reporter.forward_ct_decode
+
+    @forward_ct_decode.setter
+    def forward_ct_decode(self, value):
+        self.metrics_reporter.forward_ct_decode = value
+
+    def stream_output(self, *args, **kwargs):
+        return self.output_streamer.stream_output(*args, **kwargs)
+
+    def report_decode_stats(self, *args, **kwargs):
+        return self.metrics_reporter.report_decode_stats(*args, **kwargs)
+
     @scheduler_nvtx_method("scheduler.process_batch_result")
     def process_batch_result(
         self,
@@ -3653,9 +3797,18 @@ class Scheduler(
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
 
         if batch.forward_mode.is_decode():
-            self.batch_result_processor.process_batch_result_decode(batch, result)
+            if batch.reqs and batch.reqs[0].is_beam_search:
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
+                self.process_beam_search_decode_result(batch, result)
+            else:
+                self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
-            if batch.is_dllm():
+            if batch.reqs and batch.reqs[0].is_beam_search:
+                if result.copy_done is not None:
+                    result.copy_done.synchronize()
+                self.process_beam_search_prefill_result(batch, result.logits_output)
+            elif batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.process_batch_result_disagg_prefill(batch, result)

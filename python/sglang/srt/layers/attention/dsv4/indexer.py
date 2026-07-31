@@ -33,6 +33,7 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
 )
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,

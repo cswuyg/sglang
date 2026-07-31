@@ -30,6 +30,9 @@ class ForwardMetadata:
     query_start_loc: torch.Tensor
     mamba_cache_indices: torch.Tensor
     mamba_cache_indices_gdn: Optional[torch.Tensor] = None
+    # COW beam search: source mamba slots to READ old state from, while writing to
+    # mamba_cache_indices. None when COW is inactive (identity read = write).
+    src_mamba_cache_indices: Optional[torch.Tensor] = None
     # Mamba track DESTINATION slots (PHYSICAL, length == batch). Like
     # mamba_cache_indices: a backend-owned static buffer under cuda-graph (translated
     # in-place each replay), eager sets the translated decode tensor. The decode
