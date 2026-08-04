@@ -14,6 +14,7 @@
 """Logits processing."""
 
 import dataclasses
+import functools
 import logging
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -163,6 +164,11 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # When --lm-head-special-token-ids is set during beam search, next_token_logits
+    # has shape [#seq, num_candidates] instead of [#seq, vocab_size]. Column j
+    # corresponds to candidate_token_ids[j]. Consumers must map indices back via
+    # candidate_token_ids[indices] to recover real token IDs.
+    candidate_token_ids: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -242,6 +248,8 @@ class LogitsMetadata:
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
+    is_beam_search: bool = False
+
     mm_input_embeds: Optional[torch.Tensor] = None
 
     # DRAFT_EXTEND_V2: when set, lm_head runs only on these rows (see
@@ -295,6 +303,7 @@ class LogitsMetadata:
             token_ids_logprobs=forward_batch.token_ids_logprobs,
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             is_prefill_only=forward_batch.is_prefill_only,
+            is_beam_search=forward_batch.is_beam_search,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
@@ -379,6 +388,14 @@ class LogitsProcessor(nn.Module):
         self.enable_mis = get_server_args().enable_mis
         self.rl_on_policy_target = get_server_args().rl_on_policy_target
 
+        # Restricted LM-head optimization for beam search: when
+        # --lm-head-special-token-ids is set, decode forwards only compute logits
+        # for the specified vocab rows, reducing the matmul from [B, H] x [H, V]
+        # to [B, H] x [H, K].
+        self.lm_head_special_token_ids = get_server_args().lm_head_special_token_ids
+        self._beam_special_token_ids_by_device: Dict[str, torch.Tensor] = {}
+        self._beam_special_token_restriction_warned = False
+
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
@@ -451,9 +468,18 @@ class LogitsProcessor(nn.Module):
         )
         del hidden_states
 
+        candidate_token_ids = self._get_beam_special_candidate_token_ids(
+            pruned_states.device, logits_metadata, lm_head
+        )
+
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            logits = self._get_logits(
+                pruned_states,
+                lm_head,
+                logits_metadata,
+                candidate_token_ids=candidate_token_ids,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -461,6 +487,7 @@ class LogitsProcessor(nn.Module):
             # Decode mode or extend mode without return_logprob.
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
+                candidate_token_ids=candidate_token_ids,
                 hidden_states=hidden_states_to_store,
                 # FIXME: These fields are not logits-related but are passed through here as a
                 # workaround since ForwardBatch is local to forward_batch_generation().
@@ -474,13 +501,16 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices=input_logprob_indices,
             token_to_seq_idx=token_to_seq_idx,
             lm_head=lm_head,
-            get_logits_fn=self._get_logits,
+            get_logits_fn=functools.partial(
+                self._get_logits, candidate_token_ids=candidate_token_ids
+            ),
             logits_metadata=logits_metadata,
             skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
         )
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
+            candidate_token_ids=candidate_token_ids,
             hidden_states=hidden_states_to_store,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
@@ -713,18 +743,26 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
+        candidate_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Get logits from hidden_states.
 
         If sampled_logits_only is True, it means hidden_states only contain the
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
+
+        When ``candidate_token_ids`` is set, only the corresponding rows of the
+        LM head weight are gathered and the matmul output has shape
+        ``[B, num_candidates]`` instead of ``[B, vocab_size]``. The logits buffer
+        is skipped in this case because it is sized for the full vocabulary.
         """
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        logits = self._compute_lm_head(
+            hidden_states, lm_head, embedding_bias, candidate_token_ids
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -738,6 +776,11 @@ class LogitsProcessor(nn.Module):
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+
+        # The shared logits buffer is sized for the full vocabulary; skip it when
+        # the restricted LM-head path produces a narrower logits tensor.
+        if candidate_token_ids is not None:
+            use_logits_buffer = False
 
         logits = self._copy_logits_to_buffer(
             logits, logits_metadata, use_buffer=use_logits_buffer
@@ -758,7 +801,25 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        candidate_token_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if candidate_token_ids is not None:
+            assert hasattr(
+                lm_head, "weight"
+            ), "lm_head_special_token_ids requires lm_head.weight to exist"
+            special_weight = torch.index_select(
+                lm_head.weight, dim=0, index=candidate_token_ids
+            )
+            if self.use_fp32_lm_head:
+                return torch.matmul(
+                    hidden_states.to(torch.float32), special_weight.to(torch.float32).T
+                )
+            if self.rl_on_policy_target is not None:
+                return torch.matmul(
+                    hidden_states.bfloat16(), special_weight.T.bfloat16()
+                )
+            return torch.matmul(hidden_states.to(special_weight.dtype), special_weight.T)
+
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
@@ -800,6 +861,67 @@ class LogitsProcessor(nn.Module):
                     lm_head, hidden_states, embedding_bias
                 )
         return logits
+
+    def _get_beam_special_candidate_token_ids(
+        self,
+        device: torch.device,
+        logits_metadata: LogitsMetadata,
+        lm_head: VocabParallelEmbedding,
+    ) -> Optional[torch.Tensor]:
+        """Return the restricted candidate token-id tensor for beam search.
+
+        When --lm-head-special-token-ids is set, only these vocab rows are
+        gathered from the LM head weight, shrinking the decode logits matmul
+        from [B, H] x [H, V] to [B, H] x [H, K]. Returns None when the
+        optimization is inactive or unsupported for the current configuration.
+        """
+        if not logits_metadata.is_beam_search:
+            return None
+        if self.lm_head_special_token_ids is None:
+            return None
+        # This optimization only supports non-sharded vocab (tp=1) to keep
+        # token-id mapping unambiguous across ranks.
+        if self.do_tensor_parallel_all_gather:
+            if not self._beam_special_token_restriction_warned:
+                logger.warning(
+                    "Ignore --lm-head-special-token-ids when TP vocab is sharded. "
+                    "Current optimization supports TP=1 only."
+                )
+                self._beam_special_token_restriction_warned = True
+            return None
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            if not self._beam_special_token_restriction_warned:
+                logger.warning(
+                    "Ignore --lm-head-special-token-ids for LoRA-wrapped lm_head."
+                )
+                self._beam_special_token_restriction_warned = True
+            return None
+        if not hasattr(lm_head, "weight"):
+            if not self._beam_special_token_restriction_warned:
+                logger.warning(
+                    "Ignore --lm-head-special-token-ids for lm_head without weight."
+                )
+                self._beam_special_token_restriction_warned = True
+            return None
+
+        key = str(device)
+        token_ids = self._beam_special_token_ids_by_device.get(key)
+        if token_ids is None:
+            ids = self.lm_head_special_token_ids
+            if not ids:
+                raise ValueError(
+                    "--lm-head-special-token-ids resolved to an empty list."
+                )
+            if hasattr(lm_head, "weight"):
+                vocab_size = lm_head.weight.shape[0]
+                if min(ids) < 0 or max(ids) >= vocab_size:
+                    raise ValueError(
+                        "Found out-of-range token ID in --lm-head-special-token-ids "
+                        f"for LM head size {vocab_size}."
+                    )
+            token_ids = torch.tensor(ids, dtype=torch.long, device=device)
+            self._beam_special_token_ids_by_device[key] = token_ids
+        return token_ids
 
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata

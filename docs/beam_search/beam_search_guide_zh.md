@@ -12,7 +12,7 @@
   - [2.3 Cascade Attention](#23-cascade-attention)
   - [2.4 Decode-First 调度](#24-decode-first-调度)
   - [2.5 Mamba State 支持](#25-mamba-state-支持)
-  - [2.6 其他特性](#26-其他特性)
+  - [2.6 LM Head Special Token IDs](#26-lm-head-special-token-ids)
 
 ---
 
@@ -47,6 +47,7 @@ python -m sglang.launch_server \
 | `--enable-decode-first` | bool | `False` | 优先 decode 而非发起新 prefill |
 | `--beam-search-constraint-dict` | str | `None` | 前缀约束解码词典文件路径 |
 | `--enable-beam-mamba-double-buffer` | bool | `False` | 启用双缓冲零拷贝 mamba state 剪枝（Mamba 模型专用） |
+| `--lm-head-special-token-ids` | str | `None` | 限制 beam search 仅对指定 token ID 计算 LM head logits（见 [2.6](#26-lm-head-special-token-ids)） |
 
 ### 1.2 客户端调用
 
@@ -303,6 +304,44 @@ python -m sglang.launch_server \
 
 ---
 
+### 2.6 LM Head Special Token IDs
+
+`--lm-head-special-token-ids`：在 beam search decode 时只对指定 token ID 计算 LM head logits，把 matmul 从 `[B, H] × [H, V]` 降为 `[B, H] × [H, K]`。适用于 GenRec / SID 等输出落在小候选集上的场景。**必须与 `--enable-beam-search` 一起启用**（单独设置会直接报错）；仅 TP=1 生效；候选集需覆盖合法输出（通常含 EOS）。
+
+**数值影响说明**：softmax / logprob 是在受限候选集 `K` 上计算，而不是全词表 `V`，因此 logprob 绝对值会与全词表 baseline 不同；累加后的 beam 分数可能改变序列排序。上线前请做开启/关闭该参数的 side-by-side diff，评估排序与质量差异是否可接受。
+
+#### 参数用法
+
+格式支持离散 ID、闭区间 `start:end`，以及混合写法：
+
+```bash
+--lm-head-special-token-ids 1,2,3,151643
+--lm-head-special-token-ids 151669:153206
+--lm-head-special-token-ids 151669:153206,151645
+```
+
+启动示例（GenRec SID 区间含 `<|sid_begin|>/<|sid_end|>` + EOS）：
+
+```bash
+python -m sglang.launch_server \
+    --model-path <model_path> \
+    --enable-beam-search \
+    --lm-head-special-token-ids 151669:153206,151645 \
+    --trust-remote-code
+```
+
+客户端仍用 `use_beam_search=True` 与 `n` 发起 beam search，无需改协议字段。
+
+#### 实测加速（GenRec fp8，beam `n=50`）
+
+相对全词表 baseline（同机 A/B，HTTP non-stream）：
+
+| 并发 | RPS | 平均延迟 |
+|---:|---:|---:|
+| 1 | **~1.20×**（+20%） | **-17%** |
+| 8 | **~1.13×**（+13%） | **-11%** |
+
+SID 格式合法率与 beam_valid（落在 sid2vid）与全词表对齐（约 100% / 84%）。加速幅度取决于 `K/V` 与 decode 步数，不同模型/宽度会有差异。
 
 
 

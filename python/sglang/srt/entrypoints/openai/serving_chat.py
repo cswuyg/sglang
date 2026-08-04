@@ -706,6 +706,16 @@ class OpenAIServingChat(OpenAIBeamSearchMixin, OpenAIServingBase):
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
+        # When the server has beam search enabled and the client requests n > 1,
+        # automatically activate beam search even if use_beam_search was not set.
+        if (
+            self.tokenizer_manager.server_args.enable_beam_search
+            and request.n is not None
+            and request.n > 1
+            and not sampling_params.get("use_beam_search")
+        ):
+            sampling_params["use_beam_search"] = True
+
         # Handle single vs multiple requests
         if request.input_ids is not None:
             prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
