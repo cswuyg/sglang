@@ -167,6 +167,16 @@ class OpenAIServingCompletion(OpenAIBeamSearchMixin, OpenAIServingBase):
             "use_beam_search": request.use_beam_search,
         }
 
+        # When the server has beam search enabled and the client requests n > 1,
+        # automatically activate beam search even if use_beam_search was not set.
+        if (
+            self.tokenizer_manager.server_args.enable_beam_search
+            and request.n is not None
+            and request.n > 1
+            and not sampling_params.get("use_beam_search")
+        ):
+            sampling_params["use_beam_search"] = True
+
         # Handle response_format constraints
         if request.response_format and request.response_format.type == "json_schema":
             json_schema = request.response_format.json_schema

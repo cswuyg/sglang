@@ -1001,6 +1001,7 @@ class CPUGraphRunner:
         assert isinstance(output, LogitsProcessorOutput)
         return LogitsProcessorOutput(
             next_token_logits=output.next_token_logits[: self.raw_num_token],
+            candidate_token_ids=output.candidate_token_ids,
             hidden_states=(
                 output.hidden_states[: self.raw_num_token]
                 if output.hidden_states is not None

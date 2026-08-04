@@ -12,7 +12,7 @@
   - [2.3 Cascade Attention](#23-cascade-attention)
   - [2.4 Decode-First Scheduling](#24-decode-first-scheduling)
   - [2.5 Mamba State Support](#25-mamba-state-support)
-  - [2.6 Other Features](#26-other-features)
+  - [2.6 LM Head Special Token IDs](#26-lm-head-special-token-ids)
 
 ---
 
@@ -47,6 +47,7 @@ Full server arguments:
 | `--enable-decode-first` | bool | `False` | Prioritize decode over launching new prefill batches |
 | `--beam-search-constraint-dict` | str | `None` | Path to dictionary file for prefix-constrained decoding |
 | `--enable-beam-mamba-double-buffer` | bool | `False` | Enable zero-copy double-buffered mamba state pruning (Mamba models only) |
+| `--lm-head-special-token-ids` | str | `None` | Restrict beam-search LM head logits to specified token IDs (see [2.6](#26-lm-head-special-token-ids)) |
 
 ### 1.2 Client Usage
 
@@ -306,5 +307,47 @@ Unlike standard Transformer models whose KV cache is token-indexed, Mamba models
 **Notes**:
 - If mamba cache space is exhausted, increase `--max-mamba-cache-size` or reduce beam width / concurrency
 
+---
+
+### 2.6 LM Head Special Token IDs
+
+`--lm-head-special-token-ids` restricts beam-search decode LM head logits to a candidate token subset, shrinking the matmul from `[B, H] × [H, V]` to `[B, H] × [H, K]`. Typical for GenRec / SID-style closed candidate sets. **Must be used together with `--enable-beam-search`** (setting it alone raises an error); TP=1 only; the candidate set should cover all legal outputs (usually including EOS).
+
+**Numerical caveat**: Softmax / logprob is computed over the restricted candidate set `K` rather than the full vocabulary `V`, so absolute logprob values differ from the full-vocab baseline. Accumulated beam scores may therefore change sequence ranking. Before production use, run a side-by-side diff (with vs without this flag) and evaluate whether ranking / quality differences are acceptable for your workload.
+
+#### Usage
+
+Formats: discrete IDs, inclusive ranges `start:end`, or mixed:
+
+```bash
+--lm-head-special-token-ids 1,2,3,151643
+--lm-head-special-token-ids 151669:153206
+--lm-head-special-token-ids 151669:153206,151645
+```
+
+Server launch example (GenRec SID range including `<|sid_begin|>/<|sid_end|>` + EOS):
+
+```bash
+python -m sglang.launch_server \
+    --model-path <model_path> \
+    --enable-beam-search \
+    --lm-head-special-token-ids 151669:153206,151645 \
+    --trust-remote-code
+```
+
+Client calls are unchanged: still use `use_beam_search=True` and `n`.
+
+#### Measured speedup (GenRec fp8, beam `n=50`)
+
+Vs full-vocab baseline (same-host A/B, HTTP non-stream):
+
+| Concurrency | RPS | Avg latency |
+|---:|---:|---:|
+| 1 | **~1.20×** (+20%) | **-17%** |
+| 8 | **~1.13×** (+13%) | **-11%** |
+
+SID format validity and beam_valid (in sid2vid) match full vocab (~100% / 84%). Speedup depends on `K/V` and decode steps; results vary by model and beam width.
+
+---
 
 

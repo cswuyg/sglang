@@ -75,6 +75,8 @@ class SchedulerBeamSearchProcessorMixin:
         beam_width_list = [req.beam_width for req in batch.reqs]
         logger.info(f"[prefill process]beam_width_list: {beam_width_list}")
 
+        candidate_token_ids = logits_output.candidate_token_ids
+
         for i, req in enumerate(batch.reqs):
             logprobs_i = logits_output.logprobs[i]
 
@@ -89,6 +91,7 @@ class SchedulerBeamSearchProcessorMixin:
                 batch=batch,
                 logprobs=logprobs_i,
                 device=logits_output.logprobs.device,
+                candidate_token_ids=candidate_token_ids,
             )
 
             if req.finished():
@@ -138,6 +141,13 @@ class SchedulerBeamSearchProcessorMixin:
         beam_output_top_tokens, beam_output_top_logprobs = self._extract_beam_topk_data(
             batch, result
         )
+
+        # When --lm-head-special-token-ids is set, the topk indices are positions
+        # in the restricted candidate set, not real token IDs. Map them back so
+        # downstream expansion operates on actual vocab IDs.
+        candidate_token_ids = result.logits_output.candidate_token_ids
+        if candidate_token_ids is not None:
+            beam_output_top_tokens = candidate_token_ids[beam_output_top_tokens]
 
         reqs_for_kv_copy = []
         last_batch_slot_indices_list = []
@@ -227,6 +237,7 @@ class SchedulerBeamSearchProcessorMixin:
         batch: ScheduleBatch,
         logprobs: torch.Tensor,
         device: torch.device,
+        candidate_token_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """Initialize beam search from prefill results.
 
@@ -236,15 +247,22 @@ class SchedulerBeamSearchProcessorMixin:
         Args:
             req: Request to initialize beam search for
             batch: Schedule batch containing the request
-            logprobs: Log probabilities tensor for all tokens [vocab_size]
+            logprobs: Log probabilities tensor for all tokens [vocab_size] or
+                [num_candidates] when --lm-head-special-token-ids is set.
             device: Device where tensors are located
+            candidate_token_ids: When the LM head is restricted to a subset of
+                vocab rows, topk indices are positions in this tensor and must
+                be mapped back to real token IDs.
         """
         topk_result = logprobs.topk(req.beam_candidates, dim=0, sorted=True)
+        topk_indices = topk_result.indices
+        if candidate_token_ids is not None:
+            topk_indices = candidate_token_ids[topk_indices]
         top_logprobs_val = topk_result.values.tolist()
-        top_logprobs_idx = topk_result.indices.tolist()
+        top_logprobs_idx = topk_indices.tolist()
 
         finish_by_len = False
-        all_new_tokens = topk_result.indices
+        all_new_tokens = topk_indices
         if req.sampling_params.max_new_tokens <= 1:
             finish_mask = torch.ones(
                 all_new_tokens.size(0), dtype=torch.bool, device=device
