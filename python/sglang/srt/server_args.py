@@ -919,6 +919,26 @@ class ServerArgs:
         Optional[str],
         "Path to a dictionary file for beam search prefix-constrained decoding.",
     ] = None
+    beam_search_lm_head_special_token_ids: A[
+        Optional[Union[str, List[int]]],
+        Arg(
+            help=(
+                "Restrict LM head candidates to specified token IDs during beam "
+                "search, shrinking the decode logits matmul from [B, H] x [H, V] to "
+                "[B, H] x [H, K] (K = number of special tokens). Formats: "
+                "'id1,id2,...' or ranges like 'start:end' (inclusive), "
+                "e.g. '151669:153206,151645'. Requires --enable-beam-search; "
+                "supports TP=1 only. "
+                "Limitations: (1) CUDA graph keys do not distinguish candidate "
+                "mode, so beam and non-beam reuse the same graph — after enabling "
+                "this flag the server cannot serve non-beam-search requests; "
+                "(2) logit_bias / frequency_penalty / presence_penalty / "
+                "repetition_penalty need the full vocabulary and are unsupported; "
+                "(3) if the candidate set omits EOS, generation typically runs "
+                "until max_tokens."
+            ),
+        ),
+    ] = None
     prefill_only_disable_kv_cache: A[
         bool,
         "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
@@ -7871,6 +7891,15 @@ class ServerArgs:
 
 
     def _handle_beam_search(self):
+        # --beam-search-lm-head-special-token-ids only affects the beam-search decode path.
+        # Reject silent no-ops when the global beam-search switch is off.
+        if self.beam_search_lm_head_special_token_ids is not None and not self.enable_beam_search:
+            raise ValueError(
+                "--beam-search-lm-head-special-token-ids requires --enable-beam-search. "
+                "Please enable both flags together, e.g. "
+                "`--enable-beam-search --beam-search-lm-head-special-token-ids 151669:153206,151645`."
+            )
+
         if not self.enable_beam_search:
             return
         modified = []
@@ -7899,10 +7928,62 @@ class ServerArgs:
                     f"--decode-attention-backend={backend!r}. "
                     f"Please set --decode-attention-backend flashinfer."
                 )
+
+        if self.beam_search_lm_head_special_token_ids is not None:
+            self.beam_search_lm_head_special_token_ids = self._parse_beam_search_lm_head_special_token_ids(
+                self.beam_search_lm_head_special_token_ids
+            )
+            if not self.beam_search_lm_head_special_token_ids:
+                raise ValueError(
+                    "--beam-search-lm-head-special-token-ids parsed to an empty token set."
+                )
+
         if modified:
             logger.warning(
                 f"Beam search enabled. Automatically disabled incompatible features: {', '.join(modified)}"
             )
+
+    @staticmethod
+    def _parse_beam_search_lm_head_special_token_ids(
+        raw: Union[str, List[int]]
+    ) -> Optional[List[int]]:
+        if raw is None:
+            return None
+        if isinstance(raw, list):
+            if not all(isinstance(x, int) for x in raw):
+                raise ValueError(
+                    "--beam-search-lm-head-special-token-ids list must contain integers only."
+                )
+            # De-duplicate while preserving order.
+            return list(dict.fromkeys(raw))
+        if not isinstance(raw, str):
+            raise ValueError(
+                "--beam-search-lm-head-special-token-ids must be a string or list of integers."
+            )
+
+        parsed: List[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" in part:
+                bounds = [x.strip() for x in part.split(":")]
+                if len(bounds) != 2 or not bounds[0] or not bounds[1]:
+                    raise ValueError(
+                        f"Invalid range '{part}' in --beam-search-lm-head-special-token-ids. "
+                        "Expected format 'start:end'."
+                    )
+                start, end = int(bounds[0]), int(bounds[1])
+                if end < start:
+                    raise ValueError(
+                        f"Invalid range '{part}' in --beam-search-lm-head-special-token-ids: end < start."
+                    )
+                parsed.extend(range(start, end + 1))
+            else:
+                parsed.append(int(part))
+        # De-duplicate while preserving order.
+        return list(dict.fromkeys(parsed))
+
     def _handle_other_validations(self):
         from sglang.srt.arg_groups.overrides import resolved_view
 

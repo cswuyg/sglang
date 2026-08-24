@@ -1571,6 +1571,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 if output.next_token_logits is not None
                 else None
             ),
+            beam_search_candidate_token_ids=output.beam_search_candidate_token_ids,
             hidden_states=(
                 output.hidden_states[: self.raw_num_tokens]
                 if output.hidden_states is not None

@@ -272,6 +272,7 @@ class NPUGraphRunner(DecodeCudaGraphRunner):
                 )
             return LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
+                beam_search_candidate_token_ids=output.beam_search_candidate_token_ids,
                 full_logits=full_logits,
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]

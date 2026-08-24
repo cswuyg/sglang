@@ -12,7 +12,7 @@
   - [2.3 Cascade Attention](#23-cascade-attention)
   - [2.4 Decode-First 调度](#24-decode-first-调度)
   - [2.5 Mamba State 支持](#25-mamba-state-支持)
-  - [2.6 其他特性](#26-其他特性)
+  - [2.6 Beam Search LM Head Special Token IDs](#26-beam-search-lm-head-special-token-ids)
 
 ---
 
@@ -47,6 +47,7 @@ python -m sglang.launch_server \
 | `--enable-decode-first` | bool | `False` | 优先 decode 而非发起新 prefill |
 | `--beam-search-constraint-dict` | str | `None` | 前缀约束解码词典文件路径 |
 | `--enable-beam-mamba-double-buffer` | bool | `False` | 启用双缓冲零拷贝 mamba state 剪枝（Mamba 模型专用） |
+| `--beam-search-lm-head-special-token-ids` | str | `None` | 限制 beam search 仅对指定 token ID 计算 LM head logits；开启后有 CUDA graph / penalty / EOS 等限制（见 [2.6](#26-beam-search-lm-head-special-token-ids)） |
 
 ### 1.2 客户端调用
 
@@ -303,6 +304,50 @@ python -m sglang.launch_server \
 
 ---
 
+### 2.6 Beam Search LM Head Special Token IDs
+
+`--beam-search-lm-head-special-token-ids`：在 beam search decode 时只对指定 token ID 计算 LM head logits，把 matmul 从 `[B, H] × [H, V]` 降为 `[B, H] × [H, K]`。适用于 GenRec / SID 等输出落在小候选集上的场景。**必须与 `--enable-beam-search` 一起启用**（单独设置会直接报错）；仅 TP=1 生效。
+
+**数值影响说明**：softmax / logprob 是在受限候选集 `K` 上计算，而不是全词表 `V`，因此 logprob 绝对值会与全词表 baseline 不同；累加后的 beam 分数可能改变序列排序。上线前请做开启/关闭该参数的 side-by-side diff，评估排序与质量差异是否可接受。
+
+**风险与限制**（开启后请务必确认）：
+
+1. **CUDA graph 不区分 candidate 模式**：graph key 不区分受限 / 全词表 LM head，beam 与 non-beam 复用同一 graph。开启本参数后，该 server **无法再服务非 beam search 请求**；请把该实例视为 beam-only 部署。
+2. **依赖全词表的采样功能不可用**：`logit_bias`、`frequency_penalty`、`presence_penalty`、`repetition_penalty` 需要完整词表上的 logits，开启本参数后这些功能不可用。
+3. **候选集可能不含 EOS**：若候选 token 中没有 EOS，序列通常无法提前结束，**一般会跑满 `max_tokens` / `max_new_tokens` 才终止**。候选集应覆盖全部合法输出；若需要正常 EOS 停词，请把 EOS（及业务上的结束 token）显式加入候选集。
+
+#### 参数用法
+
+格式支持离散 ID、闭区间 `start:end`，以及混合写法：
+
+```bash
+--beam-search-lm-head-special-token-ids 1,2,3,151643
+--beam-search-lm-head-special-token-ids 151669:153206
+--beam-search-lm-head-special-token-ids 151669:153206,151645
+```
+
+启动示例（GenRec SID 区间含 `<|sid_begin|>/<|sid_end|>` + EOS）：
+
+```bash
+python -m sglang.launch_server \
+    --model-path <model_path> \
+    --enable-beam-search \
+    --beam-search-lm-head-special-token-ids 151669:153206,151645 \
+    --trust-remote-code
+```
+
+客户端仍用 `use_beam_search=True` 与 `n` 发起 beam search，无需改协议字段。
+
+#### 实测加速（GenRec fp8，beam `n=50`）
+
+相对全词表 baseline（同机 A/B，HTTP non-stream）：
+
+| 并发 | RPS | 平均延迟 |
+|---:|---:|---:|
+| 1 | **~1.20×**（+20%） | **-17%** |
+| 8 | **~1.13×**（+13%） | **-11%** |
+
+SID 格式合法率与 beam_valid（落在 sid2vid）与全词表对齐（约 100% / 84%）。加速幅度取决于 `K/V` 与 decode 步数，不同模型/宽度会有差异。
 
 
 
